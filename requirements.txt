@@ -1,0 +1,3 @@
+aiogram>=3.13,<4
+aiohttp-socks>=0.9
+tzdata

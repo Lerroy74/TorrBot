@@ -1,0 +1,37 @@
+services:
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    container_name: transmission
+    # Сеть хоста: торренты идут напрямую через роутер, мимо правил прокси
+    # для Docker-трафика (TPROXY/xray). Веб-интерфейс: http://<сервер>:9091,
+    # порт для пиров 51413 открыт прямо на сервере.
+    network_mode: host
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Moscow}
+      - USER=${TRANSMISSION_USER}
+      - PASS=${TRANSMISSION_PASS}
+    volumes:
+      - ./transmission:/config
+      - ${MEDIA_DIR}:/downloads
+    restart: unless-stopped
+
+  bot:
+    build: .
+    container_name: torrbot
+    env_file: .env
+    # host.docker.internal = сам сервер (там слушает Transmission)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/data
+      # медиатека — для /delete (удалить скачанное); путь тот же, что у Transmission
+      - ${MEDIA_DIR}:/downloads
+      # для еженедельного бэкапа в Telegram (только чтение)
+      - ./.env:/backup/env:ro
+      - ./transmission:/backup/transmission:ro
+      - ./extra:/backup/extra:ro        # сюда можно положить kodi-setup.sh и др.
+    depends_on:
+      - transmission
+    restart: unless-stopped
