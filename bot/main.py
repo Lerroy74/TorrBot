@@ -1214,6 +1214,12 @@ async def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load()
     log.info("torrbot, версия %s", __version__)
+    try:                                          # обновили/откатили бота — копия базы до любых изменений
+        snap = extras.snapshot_before_update(cfg.db_path, __version__, cfg.backup_local_dir)
+        if snap:
+            log.info("версия сменилась — копия базы: %s", snap)
+    except Exception as e:
+        log.warning("не смог сохранить копию базы перед обновлением: %r", e)
     db = DB(cfg.db_path)
 
     connector = None
@@ -1257,6 +1263,8 @@ async def run() -> None:
     tasks = [asyncio.create_task(watcher(bot, st)),
              asyncio.create_task(extras.health_loop(bot, st)),
              asyncio.create_task(extras.weekly_loop(bot, st))]
+    if cfg.backup_keep > 0:
+        tasks.append(asyncio.create_task(extras.daily_backup_loop(bot, st)))
     try:                                          # очередь закачек
         await tr.session_set(**{"download-queue-enabled": cfg.queue_size > 0,
                                 "download-queue-size": max(cfg.queue_size, 1)})

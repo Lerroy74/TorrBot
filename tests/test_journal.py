@@ -351,3 +351,48 @@ async def test_pc_not_in_library(lib):
     st.kodi = PcKodi([])
     n, note = await __import__("bot.journal", fromlist=["x"]).mark_on_pc(st, [f"{movies}/Маска (1994)"])
     assert n == 0 and "нет" in note and not st.kodi.calls
+
+
+async def test_ocenki_sorts_all_and_mine(lib):
+    """v6.5.1: «По средней» — весь список, без оценок внизу; «По моей» — мои лучшие сверху."""
+    st, session, send, press, tr, movies, series = lib
+    a = st.db.journal_note("movies", "Альфа (2001)", None, ALICE)
+    b = st.db.journal_note("movies", "Бета (2002)", None, ALICE)
+    c = st.db.journal_note("movies", "Гамма (2003)", None, ALICE)
+    st.db.rate(a, BOB, 6)
+    st.db.rate(b, BOB, 9)
+    st.db.rate(a, ALICE, 10)
+    st.db.rate(b, ALICE, 5)
+    await send(ALICE, "/ocenki")
+    labels = [x.text for x in buttons(last(session, ALICE)[2])]
+    assert "👤 По моей" in labels and "⭐ По средней" in labels
+    await press(ALICE, "jr:r:0")
+    text = last(session, ALICE)[1]
+    assert text.index("Альфа") < text.index("Бета") < text.index("Гамма")   # 8.0, 7.0, без оценок внизу
+    await press(ALICE, "jr:m:0")
+    text = last(session, ALICE)[1]
+    assert text.index("Альфа") < text.index("Бета") < text.index("Гамма")   # мои: 10, 5, нет
+    await press(BOB, "jr:m:0")
+    text = last(session, BOB)[1]
+    assert text.index("Бета") < text.index("Альфа") < text.index("Гамма")   # у Боба 9, 6
+    assert c
+
+
+async def test_delete_sort_by_rating(lib):
+    """v6.5.1: /delete — переключатель «по оценке»: худшие сверху, без оценок в конце; запоминается."""
+    st, session, send, press, tr, movies, series = lib
+    m = st.db.journal_note("movies", "Маска (1994)", None, ALICE, h="a" * 40)
+    s_ = st.db.journal_note("series", "Во все тяжкие", None, BOB, h="b" * 40)
+    st.db.rate(m, ALICE, 9)
+    st.db.rate(s_, BOB, 3)
+    await send(ADMIN, "/delete")
+    _, text, kb = last(session, ADMIN)
+    assert "большие сверху" in text and "⭐ 9.0 (1)" in text
+    await press(ADMIN, btn(kb, "По оценке").callback_data)
+    _, text, kb = last(session, ADMIN)
+    assert text.index("Во все тяжкие") < text.index("Маска") < text.index("Old.Movie")
+    assert "• ⭐ По оценке" in [x.text for x in buttons(kb)]
+    await press(ADMIN, open_card(session, ADMIN, "Маска"))            # номера — по новому порядку
+    assert "Маска (1994)" in last(session, ADMIN)[1]
+    await send(ADMIN, "/delete")                                       # выбор запомнился
+    assert "худшие по оценке сверху" in last(session, ADMIN)[1]

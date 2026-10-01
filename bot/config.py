@@ -59,6 +59,9 @@ class Config:
     weekly_day: int
     weekly_hour: int
     backup_dir: str
+    backup_local_dir: str
+    backup_keep: int
+    backup_hour: int
 
     max_height: int
     max_size_gb: float
@@ -118,6 +121,9 @@ def load() -> Config:
         weekly_day=int(_str("WEEKLY_DAY", "6")),
         weekly_hour=int(_str("WEEKLY_HOUR", "10")),
         backup_dir=_str("BACKUP_DIR", "/backup"),
+        backup_local_dir=_str("BACKUP_LOCAL_DIR", "/data/backups"),
+        backup_keep=int(_str("BACKUP_KEEP", "14")),
+        backup_hour=int(_str("BACKUP_HOUR", "4")),
         max_height=int(_str("MAX_HEIGHT", "1080")),
         max_size_gb=float(_str("MAX_SIZE_GB", "20")),
         max_size_series_gb=float(_str("MAX_SIZE_SERIES_GB", "80")),

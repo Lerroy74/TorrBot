@@ -342,6 +342,11 @@ class DB:
         """Раздачи этого названия, которые ещё на диске."""
         return self.c.execute("SELECT * FROM downloads WHERE jid=? AND removed=0", (jid,)).fetchall()
 
+    def journal_find(self, label: str) -> int | None:
+        """id записи журнала по названию (без создания)."""
+        row = self.c.execute("SELECT id FROM journal WHERE key=?", (journal_key(label),)).fetchone()
+        return row["id"] if row else None
+
     def journal_get(self, jid: int) -> sqlite3.Row | None:
         return self.c.execute("SELECT * FROM journal WHERE id=?", (jid,)).fetchone()
 
@@ -358,15 +363,17 @@ class DB:
         self.c.commit()
 
     def journal(self, mode: str = "d", uid: int = 0) -> list[sqlite3.Row]:
-        """d — по дате (новые сверху), r — по средней оценке, u — «мне оценить» (uid ещё не ответил).
+        """d — по дате (новые сверху), r — по средней, m — по моей оценке, u — «мне оценить» (uid ещё не ответил).
         В каждой строке: avg (средняя), cnt (сколько оценок), answered/my — ответ uid."""
         when = "COALESCE(j.deleted_at, j.added_at)"
         q = ("SELECT j.*, AVG(r.score) AS avg, COUNT(r.score) AS cnt,"
              " (SELECT score FROM ratings WHERE jid=j.id AND user_id=:u) AS my,"
              " EXISTS(SELECT 1 FROM ratings WHERE jid=j.id AND user_id=:u) AS answered"
              " FROM journal j LEFT JOIN ratings r ON r.jid=j.id GROUP BY j.id")
-        if mode == "r":
-            q += f" HAVING cnt>0 ORDER BY avg DESC, cnt DESC, {when} DESC"
+        if mode == "r":                                 # все: с оценками — лучшие сверху, без оценок — внизу
+            q += f" ORDER BY cnt=0, avg DESC, cnt DESC, {when} DESC"
+        elif mode == "m":                               # по моей: оценённые мной, потом «не смотрел», потом остальные
+            q += f" ORDER BY answered=0, my IS NULL, my DESC, avg DESC, {when} DESC"
         elif mode == "u":
             q += f" HAVING answered=0 ORDER BY {when} DESC"
         else:

@@ -27,6 +27,8 @@ esc = html.escape
 
 LIB_TTL = 3600
 PAGE = 8
+SORTS = {"s": "📦 По размеру", "r": "⭐ По оценке"}
+SORT_PREF = "delete_sort"          # prefs: как пользователь последний раз сортировал /delete
 
 
 def kb(rows) -> InlineKeyboardMarkup:
@@ -70,10 +72,34 @@ def describe(st, e: library.Entry, torrents: list[dict]) -> tuple[str, list[str]
     return label, who, progress
 
 
+def entry_jid(st, e: library.Entry, torrents: list[dict]) -> int | None:
+    """Запись журнала для пункта /delete: по закачке бота, иначе по названию. Ничего не создаёт."""
+    inner, _ = library.torrents_for(e.path, torrents)
+    for t in inner:
+        row = st.db.get(t["hashString"].lower())
+        if row is not None and row["jid"]:
+            return row["jid"]
+    return st.db.journal_find(describe(st, e, torrents)[0])
+
+
+def sort_entries(st, entries: list[library.Entry], torrents: list[dict], mode: str) -> list[library.Entry]:
+    """s — большие сверху (как было); r — худшие по средней оценке сверху (их проще удалять),
+    без оценок — в конце, большие первыми."""
+    if mode != "r":
+        return sorted(entries, key=lambda e: -e.size)
+
+    def key(e):
+        jid = entry_jid(st, e, torrents)
+        avg, cnt = st.db.rating_summary(jid) if jid else (None, 0)
+        return (0, avg, -cnt, -e.size) if cnt else (1, 0, 0, -e.size)
+    return sorted(entries, key=key)
+
+
 def build_router(st) -> Router:
     r = Router()
     cfg = st.cfg
     libs: dict[str, tuple[float, list[library.Entry], list[dict]]] = {}
+    sorts: dict[str, str] = {}             # lid → s/r
 
     def is_admin(uid: int) -> bool:
         return uid in cfg.admin_ids
@@ -83,31 +109,45 @@ def build_router(st) -> Router:
 
     st.hooks["may_delete"] = may_delete
 
-    async def load() -> tuple[str, list[library.Entry], list[dict]]:
+    async def load(mode: str = "s") -> tuple[str, list[library.Entry], list[dict]]:
         torrents = await st.tr.get()
         entries = await asyncio.to_thread(library.scan, cfg.dir_movies, cfg.dir_series)
+        return remember(sort_entries(st, entries, torrents, mode), torrents, mode)
+
+    def remember(entries, torrents, mode: str):
         now = time.time()
         for k in [k for k, v in libs.items() if now - v[0] > LIB_TTL]:
             del libs[k]
+            sorts.pop(k, None)
         lid = secrets.token_hex(4)
         libs[lid] = (now, entries, torrents)
+        sorts[lid] = mode
         return lid, entries, torrents
+
+    def my_sort(uid: int) -> str:
+        m = st.db.pref(uid, SORT_PREF, "s")
+        return m if m in SORTS else "s"
 
     async def list_view(lid: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
         _, entries, torrents = libs[lid]
+        mode = sorts.get(lid, "s")
         pages = max(1, (len(entries) + PAGE - 1) // PAGE)
         page = max(0, min(page, pages - 1))
         free = await st.tr.free_space(cfg.dir_movies)
         head = "🗑 <b>Удаление</b>" + (f" · 💾 свободно {fmt_size(free)}" if free is not None else "")
         if not entries:
             return head + "\n\nВ папках фильмов и сериалов пусто.", kb([])
+        order = "большие сверху" if mode == "s" else "худшие по оценке сверху, без оценок — в конце"
         lines = [f"{head}\nВсего {len(entries)} ({fmt_size(sum(e.size for e in entries))}), "
-                 f"большие сверху. Стр. {page + 1}/{pages}"]
+                 f"{order}. Стр. {page + 1}/{pages}"]
         btns = []
         for i in range(page * PAGE, min(len(entries), (page + 1) * PAGE)):
             e = entries[i]
             label, who, prog = describe(st, e, torrents)
-            extra = (f" · 👤 {esc(', '.join(who))}" if who else "") + \
+            jid = entry_jid(st, e, torrents)
+            avg, cnt = st.db.rating_summary(jid) if jid else (None, 0)
+            extra = (f" · ⭐ {avg:.1f} ({cnt})" if cnt else "") + \
+                    (f" · 👤 {esc(', '.join(who))}" if who else "") + \
                     (f" · ⬇ {prog * 100:.0f}%" if prog is not None else "")
             lines.append(f"<b>{i + 1}.</b> {'📺' if e.kind == 'series' else '🎬'} {esc(label[:70])}"
                          f" · {fmt_size(e.size)}{extra}")
@@ -119,6 +159,7 @@ def build_router(st) -> Router:
         if page < pages - 1:
             nav.append(B(text="▶", callback_data=f"lb:{lid}:{page + 1}"))
         rows.append(nav)
+        rows.append([B(text=("• " if m == mode else "") + t, callback_data=f"ls:{lid}:{m}") for m, t in SORTS.items()])
         return (lines[0] + "\n\n" + "\n".join(lines[1:]) +
                 "\n\nНажми номер — покажу подробности и спрошу, удалять ли."), kb(rows)
 
@@ -210,7 +251,7 @@ def build_router(st) -> Router:
             return
         st.db.touch(uid)
         try:
-            lid, _, _ = await load()
+            lid, _, _ = await load(my_sort(uid))
         except Exception as ex:
             await msg.answer(f"Transmission недоступен, удалять сейчас небезопасно: {esc(str(ex))}")
             return
@@ -222,7 +263,7 @@ def build_router(st) -> Router:
         if await refuse(cb):
             return
         try:
-            lid, _, _ = await load()
+            lid, _, _ = await load(my_sort(cb.from_user.id))
         except Exception as ex:
             await cb.answer(f"Transmission недоступен: {ex}", show_alert=True)
             return
@@ -244,12 +285,27 @@ def build_router(st) -> Router:
 
     async def _reload(cb: CallbackQuery):
         try:
-            lid, _, _ = await load()
+            lid, _, _ = await load(my_sort(cb.from_user.id))
         except Exception as ex:
             await cb.message.answer(f"Transmission недоступен: {esc(str(ex))}")
             return
         text, markup = await list_view(lid, 0)
         await edit(cb, text, markup)
+
+    @r.callback_query(F.data.regexp(r"^ls:[0-9a-f]{8}:[sr]$"))
+    async def delete_sort(cb: CallbackQuery):
+        """Переключить сортировку: по размеру / по оценке (запоминается для этого человека)."""
+        if await refuse(cb):
+            return
+        _, lid, mode = cb.data.split(":")
+        st.db.set_pref(cb.from_user.id, SORT_PREF, mode)
+        if lid not in libs:
+            await cb.answer("Список устарел — открываю заново")
+            return await _reload(cb)
+        await cb.answer(SORTS[mode])
+        _, entries, torrents = libs[lid]
+        new, _, _ = remember(sort_entries(st, entries, torrents, mode), torrents, mode)
+        await edit(cb, *(await list_view(new, 0)))
 
     @r.callback_query(F.data.regexp(r"^li:[0-9a-f]{8}:\d+$"))
     async def delete_card(cb: CallbackQuery):

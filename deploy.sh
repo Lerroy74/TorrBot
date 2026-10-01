@@ -17,7 +17,7 @@ OLD=$(ver "$APP"); OLD=${OLD:-old}
 mkdir -p "$VERS"
 SNAP="$VERS/v$OLD-$(date +%Y%m%d-%H%M).tar.gz"
 tar -czf "$SNAP" -C "$(dirname "$APP")" --exclude="$(basename "$APP")/transmission" \
-    --exclude="__pycache__" "$(basename "$APP")"
+    --exclude="$(basename "$APP")/data/backups" --exclude="__pycache__" "$(basename "$APP")"
 echo "Снимок текущей версии v$OLD: $SNAP"
 unzip -o -q "$ZIP" -d "$(dirname "$APP")"
 NEW=$(ver "$APP")

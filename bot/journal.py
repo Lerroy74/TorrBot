@@ -25,7 +25,7 @@ log = logging.getLogger("torrbot")
 esc = html.escape
 
 PAGE = 10
-MODES = {"d": "📅 По дате", "r": "⭐ По средней", "u": "✍ Мне оценить"}
+MODES = {"d": "📅 По дате", "r": "⭐ По средней", "m": "👤 По моей", "u": "✍ Мне оценить"}
 NOT_SEEN = "Не смотрел(а)"
 
 
@@ -163,9 +163,9 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
               callback_data=f"jr:{m}:0") for m, t in MODES.items()]
     if not everything:
         return head + "\n\nПока пусто: сюда попадает всё, что докачалось через бота.", kb([])
+    tabs = [tabs[:2], tabs[2:]]
     if not rows:
-        empty = "Ты оценил(а) всё 👍" if mode == "u" else "Оценок пока нет."
-        return f"{head}\n\n{empty}", kb([tabs])
+        return f"{head}\n\nТы оценил(а) всё 👍", kb(tabs)
     pages = max(1, (len(rows) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
     lines, btns = [], []
@@ -183,10 +183,11 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
         nav.append(B(text="◀", callback_data=f"jr:{mode}:{page - 1}"))
     if page < pages - 1:
         nav.append(B(text="▶", callback_data=f"jr:{mode}:{page + 1}"))
-    title = {"d": "новые сверху", "r": "лучшие сверху", "u": "ты ещё не оценил(а)"}[mode]
+    title = {"d": "новые сверху", "r": "лучшие сверху, без оценок — внизу",
+             "m": "твои лучшие сверху", "u": "ты ещё не оценил(а)"}[mode]
     text = (f"{head}\n{MODES[mode]} — {title}" + (f", стр. {page + 1}/{pages}" if pages > 1 else "") +
             "\n\n" + "\n".join(lines) + "\n\nНажми номер — оценки всех и твоя оценка.")
-    return text, kb([btns[j:j + 5] for j in range(0, len(btns), 5)] + [nav, tabs])
+    return text, kb([btns[j:j + 5] for j in range(0, len(btns), 5)] + [nav] + tabs)
 
 
 def card_view(st, row, mode: str, page: int, uid: int, admin: bool) -> tuple[str, InlineKeyboardMarkup]:
@@ -241,7 +242,7 @@ def build_router(st) -> Router:
         text, markup = list_view(st, "d", 0, msg.from_user.id)
         await msg.answer(text, reply_markup=markup)
 
-    @r.callback_query(F.data.regexp(r"^jr:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^jr:[drmu]:\d+$"))
     async def page(cb: CallbackQuery):
         if not allowed(cb.from_user.id):
             return await cb.answer()
@@ -249,7 +250,7 @@ def build_router(st) -> Router:
         await cb.answer()
         await edit(cb, *list_view(st, mode, int(p), cb.from_user.id))
 
-    @r.callback_query(F.data.regexp(r"^jq:\d+:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^jq:\d+:[drmu]:\d+$"))
     async def card(cb: CallbackQuery):
         if not allowed(cb.from_user.id):
             return await cb.answer()
@@ -279,7 +280,7 @@ def build_router(st) -> Router:
             text += f"\nСредняя сейчас {avg_text(avg, cnt)} — все оценки в /ocenki"
         await edit(cb, text, None)
 
-    @r.callback_query(F.data.regexp(r"^rt:\d+:\d+(:[dru]:\d+)?$"))
+    @r.callback_query(F.data.regexp(r"^rt:\d+:\d+(:[drmu]:\d+)?$"))
     async def rate(cb: CallbackQuery):
         """rt:jid:1..10 — оценка; rt:jid:0 из вопроса — «не смотрел(а)»; rt:jid:0:… в /ocenki — сбросить свою."""
         uid = cb.from_user.id
@@ -302,7 +303,7 @@ def build_router(st) -> Router:
         await cb.answer(f"⭐ {n}/10" if n else "Ок, не смотрел(а)")
         await answered(cb, row, n or None, tail)
 
-    @r.callback_query(F.data.regexp(r"^rn:\d+:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^rn:\d+:[drmu]:\d+$"))
     async def not_seen(cb: CallbackQuery):
         uid = cb.from_user.id
         if not allowed(uid):
@@ -316,7 +317,7 @@ def build_router(st) -> Router:
         await cb.answer("Ок, не смотрел(а)")
         await answered(cb, row, None, [mode, p])
 
-    @r.callback_query(F.data.regexp(r"^jw:\d+:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^jw:\d+:[drmu]:\d+$"))
     async def on_pc(cb: CallbackQuery):
         if not allowed(cb.from_user.id):
             return await cb.answer()
@@ -334,7 +335,7 @@ def build_router(st) -> Router:
         text, markup = card_for(st, row, mode, int(p), cb.from_user.id)
         await edit(cb, f"{note}\n\n{text}", markup)
 
-    @r.callback_query(F.data.regexp(r"^jx:\d+:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^jx:\d+:[drmu]:\d+$"))
     async def remove_ask(cb: CallbackQuery):
         if cb.from_user.id not in st.cfg.admin_ids:
             return await cb.answer("Только для администратора", show_alert=True)
@@ -348,7 +349,7 @@ def build_router(st) -> Router:
                    kb([[B(text="✖ Да, убрать", callback_data=f"jy:{jid}:{mode}:{p}"),
                         B(text="Нет", callback_data=f"jq:{jid}:{mode}:{p}")]]))
 
-    @r.callback_query(F.data.regexp(r"^jy:\d+:[dru]:\d+$"))
+    @r.callback_query(F.data.regexp(r"^jy:\d+:[drmu]:\d+$"))
     async def remove_yes(cb: CallbackQuery):
         if cb.from_user.id not in st.cfg.admin_ids:
             return await cb.answer("Только для администратора", show_alert=True)

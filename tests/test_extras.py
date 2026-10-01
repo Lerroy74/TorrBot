@@ -235,7 +235,8 @@ async def test_report_and_backup(env, tmp_path):
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         got = set(tar.getnames())
         assert tar.extractfile(".env").read() == b"BOT_TOKEN=secret"
-    assert got == {"data/bot.sqlite3", ".env", "extra/kodi-setup.sh"} == set(names)
+    assert got - {"MANIFEST.txt"} == {"data/bot.sqlite3", ".env", "extra/kodi-setup.sh"} == set(names)
+    assert "MANIFEST.txt" in got
 
 
 def test_next_weekly():
@@ -315,3 +316,35 @@ async def test_report_friendly_titles(env):
     st.db.mark_done("b" * 40)
     text = await extras.weekly_report(st)
     assert "🎬 Матрица\n" in text and "📺 Во все тяжкие (2008)" in text and "Вачовски" not in text
+
+
+def test_local_backups_keep_and_manifest(env, tmp_path):
+    """v6.5.1: ежедневный бэкап на диск, хранятся последние BACKUP_KEEP; внутри MANIFEST с версией."""
+    import io as _io
+    import tarfile as _tar
+    from bot import __version__
+    st, session, send, press, mp = env
+    st.cfg = st.cfg.__class__(**{**st.cfg.__dict__, "backup_dir": str(tmp_path / "b"),
+                                 "backup_local_dir": str(tmp_path / "bk"), "backup_keep": 3})
+    stamps = iter(range(10, 60))
+    mp.setattr(extras, "now_local", lambda: __import__("datetime").datetime(2026, 10, 2, 4, next(stamps)))
+    paths = [extras.save_local_backup(st) for _ in range(5)]
+    left = [f for f, _ in extras.local_backups(st)]
+    assert left == [p.rsplit("/", 1)[1] for p in paths[-3:]]
+    with _tar.open(paths[-1]) as t:
+        man = t.extractfile("MANIFEST.txt").read().decode()
+    assert f"version={__version__}" in man and "data/bot.sqlite3" in man
+
+
+def test_snapshot_before_update(tmp_path):
+    """Сменилась версия — копия базы до открытия; та же версия — копии нет; хранятся последние 5."""
+    from bot.db import DB
+    db_path, bk = str(tmp_path / "data" / "bot.sqlite3"), str(tmp_path / "data" / "backups")
+    assert extras.snapshot_before_update(db_path, "6.5", bk) is None      # базы ещё нет — копировать нечего
+    d = DB(db_path)
+    d.allow(42, "Тест")
+    d.c.close()
+    snap = extras.snapshot_before_update(db_path, "6.5.1", bk)
+    assert snap and "before-v6.5.1-from-v6.5" in snap
+    assert DB(snap).is_allowed(42)
+    assert extras.snapshot_before_update(db_path, "6.5.1", bk) is None    # перезапуск той же версии

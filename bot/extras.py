@@ -311,8 +311,14 @@ async def weekly_report(st) -> str:
     return "\n".join(lines)
 
 
+BACKUP_PREFIX = "torrbot-backup-"
+PRE_UPDATE_KEEP = 5
+
+
 def make_backup(st) -> tuple[bytes, list[str]]:
-    """tar.gz: база бота (консистентная копия), .env, settings.json Transmission, файлы из extra/."""
+    """tar.gz: база бота (консистентная копия), .env, settings.json Transmission, файлы из extra/
+    и MANIFEST.txt (версия, дата, состав) — его читает restore.sh."""
+    from . import __version__
     buf, names = io.BytesIO(), []
     with tarfile.open(fileobj=buf, mode="w:gz") as tar, tempfile.TemporaryDirectory() as tmp:
         dbcopy = os.path.join(tmp, "bot.sqlite3")
@@ -333,18 +339,102 @@ def make_backup(st) -> tuple[bytes, list[str]]:
                 if os.path.isfile(p) and os.path.getsize(p) < 20 * 1024 ** 2:
                     tar.add(p, f"extra/{f}")
                     names.append(f"extra/{f}")
+        manifest = (f"torrbot backup\nversion={__version__}\ncreated={now_local():%Y-%m-%d %H:%M}\n"
+                    f"files={','.join(names)}\n").encode()
+        info = tarfile.TarInfo("MANIFEST.txt")
+        info.size, info.mtime = len(manifest), int(time.time())
+        tar.addfile(info, io.BytesIO(manifest))
     return buf.getvalue(), names
+
+
+def prune(folder: str, prefix: str, keep: int) -> None:
+    """Оставить keep самых новых файлов с этим префиксом (имена содержат дату — сортируются по ней)."""
+    files = sorted(f for f in os.listdir(folder) if f.startswith(prefix))
+    for f in files[:max(0, len(files) - keep)]:
+        try:
+            os.remove(os.path.join(folder, f))
+        except OSError as e:
+            log.warning("не смог удалить старый бэкап %s: %r", f, e)
+
+
+def save_local_backup(st) -> str:
+    """Ежедневный бэкап на диск сервера: ~/torrbot/data/backups/torrbot-backup-ГГГГММДД-ЧЧММ.tar.gz.
+    Хранятся последние BACKUP_KEEP. Вернёт путь."""
+    folder = st.cfg.backup_local_dir
+    os.makedirs(folder, exist_ok=True)
+    data, _ = make_backup(st)
+    path = os.path.join(folder, f"{BACKUP_PREFIX}{now_local():%Y%m%d-%H%M}.tar.gz")
+    with open(path + ".part", "wb") as f:
+        f.write(data)
+    os.replace(path + ".part", path)
+    prune(folder, BACKUP_PREFIX, max(1, st.cfg.backup_keep))
+    return path
+
+
+def local_backups(st) -> list[tuple[str, int]]:
+    folder = st.cfg.backup_local_dir
+    if not os.path.isdir(folder):
+        return []
+    return [(f, os.path.getsize(os.path.join(folder, f))) for f in sorted(os.listdir(folder))
+            if f.endswith((".tar.gz", ".sqlite3"))]
+
+
+def snapshot_before_update(db_path: str, version: str, folder: str) -> str | None:
+    """Вызывается при старте ДО открытия базы: если версия бота сменилась (обновление или откат),
+    сохраняет копию базы в backups/before-vНОВАЯ-from-vСТАРАЯ-дата.sqlite3 — до того, как новый
+    код что-то в ней поменяет. Работает для любых будущих обновлений. Вернёт путь копии."""
+    marker = os.path.join(os.path.dirname(db_path) or ".", "LAST_VERSION")
+    old = ""
+    if os.path.isfile(marker):
+        with open(marker) as f:
+            old = f.read().strip()
+    out = None
+    if old != version and os.path.isfile(db_path):
+        os.makedirs(folder, exist_ok=True)
+        out = os.path.join(folder, f"before-v{version}-from-v{old or 'old'}-{now_local():%Y%m%d-%H%M}.sqlite3")
+        src = sqlite3.connect(db_path)
+        dst = sqlite3.connect(out)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        prune(folder, "before-v", PRE_UPDATE_KEEP)
+    if old != version:
+        os.makedirs(os.path.dirname(marker) or ".", exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(version)
+    return out
 
 
 async def send_backup(bot: Bot, st) -> None:
     data, names = make_backup(st)
-    fname = f"torrbot-backup-{now_local():%Y%m%d}.tar.gz"
-    cap = ("🗄 Бэкап torrbot: " + ", ".join(names) + "\n⚠ Внутри пароли и токены — не пересылай никому.")
+    fname = f"{BACKUP_PREFIX}{now_local():%Y%m%d}.tar.gz"
+    local = local_backups(st)
+    cap = ("🗄 Бэкап torrbot: " + ", ".join(names) +
+           f"\nНа сервере ещё {len(local)} копий в ~/torrbot/data/backups." +
+           "\nВосстановить: sudo sh ~/torrbot/restore.sh <файл>" +
+           "\n⚠ Внутри пароли и токены — не пересылай никому.")
     for a in st.cfg.admin_ids:
         try:
             await bot.send_document(a, BufferedInputFile(data, fname), caption=cap)
         except Exception as e:
             log.warning("бэкап не отправился: %r", e)
+
+
+async def daily_backup_loop(bot: Bot, st) -> None:
+    """Каждый день в BACKUP_HOUR — бэкап на диск сервера. Не получилось — сообщить админу."""
+    while True:
+        now = now_local()
+        t = now.replace(hour=st.cfg.backup_hour % 24, minute=0, second=0, microsecond=0)
+        if t <= now:
+            t += timedelta(days=1)
+        await asyncio.sleep((t - now).total_seconds())
+        try:
+            path = await asyncio.to_thread(save_local_backup, st)
+            log.info("ежедневный бэкап: %s", path)
+        except Exception as e:
+            log.warning("ежедневный бэкап не получился: %r", e)
+            await notify_admins(bot, st, f"⚠ Ежедневный бэкап не получился: {esc(str(e))}")
+        await asyncio.sleep(60)
 
 
 def next_weekly(now: datetime, day: int, hour: int) -> datetime:
@@ -659,8 +749,28 @@ def build_router(st) -> Router:
 
     @r.message(Command("backup"))
     async def backup(msg: Message, bot: Bot):
+        """Бэкап сейчас: копия на диск сервера + файл в Telegram."""
         if admin(msg.from_user.id):
+            try:
+                await asyncio.to_thread(save_local_backup, st)
+            except Exception as e:
+                await msg.answer(f"⚠ На диск сервера не сохранилось: {esc(str(e))}")
             await send_backup(bot, st)
+
+    @r.message(Command("backups"))
+    async def backups(msg: Message):
+        """Какие копии лежат на сервере и как восстановить."""
+        if not admin(msg.from_user.id):
+            return
+        files = local_backups(st)
+        lines = [f"• <code>{esc(f)}</code> — {sz / 1024:.0f} КБ" for f, sz in files[-20:]]
+        await msg.answer(
+            "🗄 <b>Копии на сервере</b> (~/torrbot/data/backups):\n" + ("\n".join(lines) or "пока нет") +
+            f"\n\nЕжедневно в {st.cfg.backup_hour}:00, хранятся последние {st.cfg.backup_keep}; "
+            "перед каждым обновлением — копия базы before-v….\n"
+            "Еженедельно и по /backup — файл сюда, в Telegram.\n\n"
+            "Восстановить базу: <code>sudo sh ~/torrbot/restore.sh</code> — покажет список, "
+            "потом <code>sudo sh ~/torrbot/restore.sh имя-файла</code>.")
 
     # --- что посмотреть ---
     @r.message(Command("random"))
