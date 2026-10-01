@@ -201,3 +201,22 @@ async def test_kodi_client(aiohttp_client):
         raise AssertionError
     except kodi.KodiError as e:
         assert "логин" in str(e)
+
+
+async def test_cleanup_asks_owner_rating(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLEANUP_DAYS", "14")
+    cfg = load()
+    db = DB(str(tmp_path / "db.sqlite3"))
+    old = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
+    tr = FakeTr([{"hashString": "a", "name": "Old.mkv", "downloadDir": "/downloads/movies", "totalSize": 5}])
+    db.add_download("a", "a", "a", "movies", 555, 100)
+    db.mark_done("a")
+    jid = db.journal_note("movies", "Старый фильм (1990)", None, 100, h="a")
+    db.set_warned("a", int(time.time()) - 30 * 3600)
+    st = main.State(cfg, db, tr, None)
+    st.kodi = FakeKodi([ep("/movies/Old.mkv", 1, old)])
+    bot = FakeBot()
+    await main.cleanup_once(bot, st)
+    assert tr.removed == [("a", True)]
+    assert "Как вам" in bot.msgs[-1][0] and "Старый фильм (1990)" in bot.msgs[-1][0]
+    assert db.journal_get(jid)["deleted_at"]

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiohttp
 
@@ -27,6 +27,7 @@ class Info:
     overview: str
     rating: float
     poster: str | None
+    cast: list[str] = field(default_factory=list)     # главные актёры (заполняется отдельно)
 
     def caption(self, max_overview: int = 600) -> str:
         """Подпись к обложке (HTML, укладывается в лимит Telegram 1024 символа)."""
@@ -39,6 +40,8 @@ class Info:
         lines = [head]
         if self.original_title and self.original_title.lower() != self.title.lower():
             lines.append(f"<i>{esc(self.original_title)}</i>")
+        if self.cast:
+            lines.append(f"👥 {esc(', '.join(self.cast))}")
         ov = self.overview.strip()
         if len(ov) > max_overview:
             ov = ov[:max_overview].rsplit(" ", 1)[0] + "…"
@@ -217,6 +220,30 @@ def person_years(d: dict) -> str:
 
 def person_photo(d: dict) -> str | None:
     return f"{IMG}{d['profile_path']}" if d.get("profile_path") else None
+
+
+def top_cast(credits: dict, n: int = 3) -> list[str]:
+    """Главные актёры из ответа /credits или /aggregate_credits — по порядку в титрах."""
+    cast = [c for c in credits.get("cast") or [] if c.get("name")]
+    cast.sort(key=lambda c: c.get("order") if c.get("order") is not None else 999)
+    out: list[str] = []
+    for c in cast:
+        if c["name"] not in out:
+            out.append(c["name"])
+        if len(out) >= n:
+            break
+    return out
+
+
+async def cast(http: aiohttp.ClientSession, key: str, info: Info, lang: str = "ru-RU", n: int = 3) -> list[str]:
+    """Главные актёры фильма/сериала (у сериала — по всем сезонам)."""
+    path = f"/tv/{info.tmdb_id}/aggregate_credits" if info.is_tv else f"/movie/{info.tmdb_id}/credits"
+    return top_cast(await _get(http, key, path, {"language": lang}), n)
+
+
+def surname(name: str) -> str:
+    """«Jim Carrey» → «Carrey» — для короткой подписи на кнопке."""
+    return (name.split() or [""])[-1]
 
 
 def tracker_queries(info: Info) -> list[str]:

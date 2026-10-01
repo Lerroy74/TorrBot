@@ -183,7 +183,8 @@ async def test_user_deletes_own_movie_admin_notified(lib):
     _, ask, kb = last(session, ALICE)
     assert "Точно удалить" in ask
     await press(ALICE, btn(kb, "Да").callback_data)
-    assert "🗑 Удалено: <b>Маска (1994)</b>" in last(session, ALICE)[1]
+    assert "🗑 Удалено: <b>Маска (1994)</b>" in session.sent(ALICE)[-2][1]
+    assert "Как вам" in last(session, ALICE)[1]                  # v6.3: просим оценку
     assert not os.path.exists(f"{movies}/Маска (1994)")          # и файл, и папка «Название (год)»
     assert tr.removed == ["a" * 40]
     assert st.db.get("a" * 40)["removed_reason"] == "delete"

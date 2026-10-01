@@ -20,7 +20,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import cleanup, library
+from . import cleanup, journal, library
 
 log = logging.getLogger("torrbot")
 esc = html.escape
@@ -290,6 +290,7 @@ def build_router(st) -> Router:
             return
         e, top = got
         label, _, _ = describe(st, top, libs[lid][2])
+        top_label = label
         if e is not top:
             label = f"{label} → {e.name}"
         if not library.safe_target(e.path, cfg.dir_movies, cfg.dir_series):
@@ -306,11 +307,13 @@ def build_router(st) -> Router:
                             show_alert=True)
             return
         await cb.answer("Удаляю…")
-        owners = set()
+        owners, jid = set(), None
         try:
             for t in inner:
                 h = t["hashString"].lower()
                 row = st.db.get(h)
+                if row is not None and row["jid"] and not jid:
+                    jid = row["jid"]
                 await st.tr.remove(h, delete_data=True)
                 st.db.mark_removed(h, "delete")
                 if row is not None and row["user_id"]:
@@ -326,11 +329,16 @@ def build_router(st) -> Router:
             return
         libs.pop(lid, None)
         st.db.add_deletion(uid, e.kind, label[:200], e.size)
+        if not jid:                                    # положено руками или скачано до v6.3
+            jid = st.db.journal_note(e.kind, top_label)
+        if jid and e is top:
+            st.db.journal_deleted(jid, uid)
         log.info("удалено пользователем %s: %s (%s)", uid, e.path, fmt_size(e.size))
         free = await st.tr.free_space(cfg.dir_movies)
         tail = f"\n💾 Свободно теперь: {fmt_size(free)}" if free is not None else ""
         await edit(cb, f"🗑 Удалено: <b>{esc(label[:150])}</b> ({fmt_size(e.size)}){tail}",
                    kb([[B(text="🗑 Удалить ещё", callback_data="lr")]]))
+        await journal.ask(bot, st, cb.message.chat.id, jid)
         if st.kodi:
             asyncio.create_task(kodi_clean_later(st))
         who = short_name(st, uid) or str(uid)

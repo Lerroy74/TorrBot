@@ -18,7 +18,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
-from . import __version__, cleanup, deleter, extras, jacred, kodi, tmdb, wiki
+from . import __version__, cleanup, deleter, extras, jacred, journal, kodi, tmdb, wiki
 from .config import Config, load
 from .db import DB
 from .transmission import Transmission, TransmissionError
@@ -41,6 +41,7 @@ class State:
         self.choices: dict[str, tuple[float, str, list[tmdb.Info], list[tmdb.Person]]] = {}
         self.hooks: dict = {}                    # функции роутера для extras (add_magnet, search_for…)
         self.infos: dict = {}                    # (kind, tmdb_id) → Info, для кнопок под обложкой
+        self.casts: dict[tuple[bool, int], tuple[float, list[str]]] = {}   # актёры по (сериал?, id)
         self.health = extras.Health()
 
     def is_allowed(self, uid: int) -> bool:
@@ -93,6 +94,43 @@ async def find_info(st: State, query: str) -> list[dict]:
     except Exception as e:
         log.warning("tmdb: %r", e)
         return []
+
+
+CAST_TTL = 7 * 24 * 3600
+
+
+async def add_cast(st: State, infos: list[tmdb.Info], timeout: float = 6) -> None:
+    """Дописывает к вариантам 2–3 главных актёров (чтобы отличить одноимённые фильмы).
+    Запросы к TMDB параллельно, с кэшем на неделю; не успели или ошибка — просто без актёров."""
+    if not st.cfg.tmdb_key or not infos:
+        return
+    now = time.time()
+    need = []
+    for inf in infos:
+        got = st.casts.get((inf.is_tv, inf.tmdb_id))
+        if got and now - got[0] < CAST_TTL:
+            inf.cast = got[1]
+        elif inf.tmdb_id and inf not in need:
+            need.append(inf)
+    if not need:
+        return
+
+    async def one(inf: tmdb.Info) -> None:
+        try:
+            names = await tmdb.cast(st.tmdb_http, st.cfg.tmdb_key, inf, st.cfg.tmdb_lang)
+        except Exception as e:
+            log.info("tmdb cast %s: %r", inf.tmdb_id, e)
+            return
+        st.casts[(inf.is_tv, inf.tmdb_id)] = (time.time(), names)
+        inf.cast = names
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*(one(i) for i in need)), timeout)
+    except asyncio.TimeoutError:
+        log.info("tmdb cast: не дождался актёров")
+    if len(st.casts) > 2000:
+        for k in sorted(st.casts, key=lambda k: st.casts[k][0])[:500]:
+            del st.casts[k]
 
 
 def fmt_size(n: int | float) -> str:
@@ -184,13 +222,17 @@ def render_choice(title: str, infos: list[tmdb.Info], persons: list[tmdb.Person]
     """Список «что именно смотреть» — кнопки фильмов/сериалов и людей."""
     lines = [title]
     rows = []
+    labels = [tmdb.short_label(inf) for inf in infos]
     for i, inf in enumerate(infos):
         extra = f" · ⭐ {inf.rating:.1f}" if inf.rating else ""
         orig = (f"\n   <i>{esc(inf.original_title)}</i>"
                 if inf.original_title and inf.original_title.lower() != inf.title.lower() else "")
-        lines.append(f"<b>{i + 1}.</b> {esc(tmdb.short_label(inf, 80))}{extra}{orig}")
-        rows.append([InlineKeyboardButton(text=f"{i + 1}. {tmdb.short_label(inf)}",
-                                          callback_data=f"pk:{cid}:{i}")])
+        cast = f"\n   👥 {esc(', '.join(inf.cast))}" if inf.cast else ""
+        lines.append(f"<b>{i + 1}.</b> {esc(tmdb.short_label(inf, 80))}{extra}{orig}{cast}")
+        btn = f"{i + 1}. {labels[i]}"
+        if labels.count(labels[i]) > 1 and inf.cast:        # одинаковые кнопки — добавим актёра
+            btn += f" · {tmdb.surname(inf.cast[0])}"
+        rows.append([InlineKeyboardButton(text=btn, callback_data=f"pk:{cid}:{i}")])
     for i, p in enumerate(persons):
         role = {"Acting": "актёр", "Directing": "режиссёр"}.get(p.department, "")
         kf = f" — {esc(', '.join(p.known_for))}" if p.known_for else ""
@@ -344,6 +386,7 @@ def build_router(st: State) -> Router:
                 "• magnet-ссылку — поставлю сразу.\n\n"
                 "/status — что сейчас качается (там же можно отменить)\n"
                 + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](u.id) else "")
+                + "/ocenki — что смотрели и наши оценки\n"
                 + "/id — твой Telegram ID")
             return
         if st.db.is_blocked(u.id):
@@ -689,6 +732,7 @@ def build_router(st: State) -> Router:
         названию, оставляем только то, что про этот фильм (название + год)."""
         label = tmdb.short_label(info, 80)
         wait = await msg.answer(f"🔎 Ищу раздачи: {esc(label)}…")
+        cast_task = asyncio.create_task(add_cast(st, [info]))     # для подписи к обложке
         found = await asyncio.gather(*(jacred.search(st.http, cfg, q) for q in tmdb.tracker_queries(info)),
                                      return_exceptions=True)
         items = [it for res in found if not isinstance(res, BaseException) for it in res]
@@ -709,6 +753,7 @@ def build_router(st: State) -> Router:
             await wait.edit_text(f"{esc(label)}\n{hint}")
             return
         await wait.delete()
+        await cast_task
         await show_releases(msg, label, results, info, note)
 
     async def raw_search(msg: Message, query: str) -> None:
@@ -795,6 +840,7 @@ def build_router(st: State) -> Router:
                                   "место действия, профессии героев.", [], [], cid, text[:100])
             await wait.edit_text(t, reply_markup=kb)
             return
+        await add_cast(st, infos)
         t, kb = render_choice("📖 По описанию похоже на:", infos, [], cid, None)
         await wait.edit_text(t, reply_markup=kb)
 
@@ -836,6 +882,7 @@ def build_router(st: State) -> Router:
             await cb.message.edit_text("TMDB сейчас не отвечает, попробуй позже.")
             return
         label = podbor_label(parts)
+        await add_cast(st, infos[:10])
         cid = st.put_choice(label, infos[:10], [])
         base = "pb:" + ":".join(parts[:5])
         nav = []
@@ -906,12 +953,14 @@ def build_router(st: State) -> Router:
             else:
                 await raw_search(msg, query)    # TMDB не знает — ищем как есть
             return
+        await add_cast(st, infos)
         cid = st.put_choice(query, infos, persons)
         text, kb = render_choice(f"🔎 <b>{esc(query)}</b> — что именно ищем?", infos, persons, cid, query,
                                  plot=maybe_plot)
         await msg.answer(text, reply_markup=kb)
 
     r.include_router(deleter.build_router(st))
+    r.include_router(journal.build_router(st))
     st.hooks.update(add_magnet=add_magnet, search_for=search_for, can_cancel=can_cancel,
                     send_with_poster=send_with_poster,
                     nice_name=lambda t: nice_name(cfg, t, st.db.get(t["hashString"].lower()))[0])
@@ -937,6 +986,8 @@ async def watcher(bot: Bot, st: State):
                     st.db.mark_done(h)
                     finished_any = True
                     name, series = nice_name(st.cfg, t, row)
+                    st.db.journal_note("series" if series else "movies", name, row["poster"],
+                                       row["user_id"], h=h)
                     raw = t.get("name") or ""
                     raw_line = f"\n<i>{esc(raw[:300])}</i>" if raw and raw != name else ""
                     await send_with_poster(
@@ -1057,6 +1108,8 @@ async def cleanup_once(bot: Bot, st: State) -> None:
             for a in cfg.admin_ids:
                 await bot.send_message(a, f"🗑 Удалил просмотренное: <b>{name}</b> "
                                           f"(освободилось {fmt_size(t.get('totalSize', 0))})")
+            if row["jid"] and not (st.db.journal_get(row["jid"]) or {"rating": None})["rating"]:
+                await journal.ask(bot, st, row["chat_id"], row["jid"])   # тот, кто ставил, — оцените
     if removed_any:
         await asyncio.sleep(10)
         await st.kodi.clean()
@@ -1102,6 +1155,7 @@ async def run() -> None:
         BotCommand(command="voices", description="Любимые озвучки"),
         BotCommand(command="plot", description="Найти фильм по описанию сюжета"),
         BotCommand(command="delete", description="Удалить скачанное (освободить место)"),
+        BotCommand(command="ocenki", description="Что смотрели и наши оценки"),
         BotCommand(command="id", description="Мой Telegram ID"),
         BotCommand(command="start", description="Справка"),
     ])
