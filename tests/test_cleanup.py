@@ -209,6 +209,7 @@ async def test_cleanup_asks_owner_rating(tmp_path, monkeypatch):
     db = DB(str(tmp_path / "db.sqlite3"))
     old = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
     tr = FakeTr([{"hashString": "a", "name": "Old.mkv", "downloadDir": "/downloads/movies", "totalSize": 5}])
+    db.allow(100, "Вася")
     db.add_download("a", "a", "a", "movies", 555, 100)
     db.mark_done("a")
     jid = db.journal_note("movies", "Старый фильм (1990)", None, 100, h="a")
@@ -220,3 +221,26 @@ async def test_cleanup_asks_owner_rating(tmp_path, monkeypatch):
     assert tr.removed == [("a", True)]
     assert "Как вам" in bot.msgs[-1][0] and "Старый фильм (1990)" in bot.msgs[-1][0]
     assert db.journal_get(jid)["deleted_at"]
+
+
+async def test_rating_after_watching_on_tv(tmp_path, monkeypatch):
+    """v6.5: досмотрели на ТВ — спросить того, кто качал, один раз; первый проход — без рассылки."""
+    monkeypatch.setenv("CLEANUP_DAYS", "0")
+    cfg = load()
+    db = DB(str(tmp_path / "db.sqlite3"))
+    db.allow(100, "Вася")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tr = FakeTr([{"hashString": "a", "name": "Old.mkv", "downloadDir": "/downloads/movies", "totalSize": 5},
+                 {"hashString": "b", "name": "New.mkv", "downloadDir": "/downloads/movies", "totalSize": 5}])
+    for h, label in (("a", "Старый (1990)"), ("b", "Новый (2024)")):
+        db.add_download(h, h, h, "movies", 555, 100)
+        db.mark_done(h)
+        db.journal_note("movies", label, None, 100, h=h)
+    st = main.State(cfg, db, tr, None)
+    st.kodi = FakeKodi([ep("/movies/Old.mkv", 1, now), ep("/movies/New.mkv", 0)])
+    bot = FakeBot()
+    assert await main.rating_watch_once(bot, st) == 0 and not bot.msgs     # первый проход: старое не трогаем
+    st.kodi.items[1] = ep("/movies/New.mkv", 1, now)                       # досмотрели «Новый»
+    assert await main.rating_watch_once(bot, st) == 1
+    assert "Как вам" in bot.msgs[-1][0] and "Новый (2024)" in bot.msgs[-1][0]
+    assert await main.rating_watch_once(bot, st) == 0                      # второй раз не спрашиваем

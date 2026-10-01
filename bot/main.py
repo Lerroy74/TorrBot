@@ -398,7 +398,7 @@ def build_router(st: State) -> Router:
                 "• magnet-ссылку — поставлю сразу.\n\n"
                 "/status — что сейчас качается (там же можно отменить)\n"
                 + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](u.id) else "")
-                + "/ocenki — что смотрели и наши оценки\n"
+                + "/ocenki — что смотрели и оценки (у каждого своя)\n"
                 + "/id — твой Telegram ID")
             return
         if st.db.is_blocked(u.id):
@@ -962,9 +962,7 @@ def build_router(st: State) -> Router:
         await cb.answer("Отмечаю…")
         _, note = await journal.mark_on_pc(st, [_torrent_root(torrents[0])])
         await cb.message.answer(note)
-        j = st.db.journal_get(row["jid"]) if row["jid"] else None
-        if j is not None and not j["rating"]:
-            await journal.ask(cb.bot, st, cb.message.chat.id, j["id"])
+        await journal.ask(cb.bot, st, row["jid"], cb.from_user.id, cb.message.chat.id, "pc", force=True)
 
     @r.callback_query(F.data.regexp(r"^bk:[0-9a-f]+$"))
     async def back_to_choice(cb: CallbackQuery):
@@ -1173,11 +1171,43 @@ async def cleanup_once(bot: Bot, st: State) -> None:
             for a in cfg.admin_ids:
                 await bot.send_message(a, f"🗑 Удалил просмотренное: <b>{name}</b> "
                                           f"(освободилось {fmt_size(t.get('totalSize', 0))})")
-            if row["jid"] and not (st.db.journal_get(row["jid"]) or {"rating": None})["rating"]:
-                await journal.ask(bot, st, row["chat_id"], row["jid"])   # тот, кто ставил, — оцените
+            await journal.ask(bot, st, row["jid"], row["user_id"], row["chat_id"], "cleanup")   # тот, кто ставил
     if removed_any:
         await asyncio.sleep(10)
         await st.kodi.clean()
+
+
+WATCH_SEEDED = "rate_watch_seeded"      # prefs(user_id=0): первый проход проверки уже был
+
+
+async def rating_watch_once(bot: Bot, st: State) -> int:
+    """v6.5: досмотрели на ТВ (Kodi отметил просмотренным) — спросить оценку у того, кто ставил.
+    Первый проход после обновления ничего не шлёт: всё, что уже просмотрено, просто
+    помечается «спрошено», чтобы не засыпать людей вопросами про старое. Вернёт, сколько спросили."""
+    seeded = st.db.pref(0, WATCH_SEEDED) == "1"
+    sent = 0
+    for row, t, v in await _judge_all(st):
+        if v.status != "watched" or not row["jid"] or not row["user_id"]:
+            continue
+        if not seeded:
+            st.db.note_ask(row["jid"], row["user_id"], "migrated")
+        elif await journal.ask(bot, st, row["jid"], row["user_id"], row["chat_id"], "watched"):
+            sent += 1
+    if not seeded:
+        st.db.set_pref(0, WATCH_SEEDED, "1")
+    return sent
+
+
+async def rating_watch(bot: Bot, st: State) -> None:
+    await asyncio.sleep(60)
+    while True:
+        try:
+            n = await rating_watch_once(bot, st)
+            if n:
+                log.info("спросил оценку после просмотра: %d", n)
+        except Exception as e:
+            log.info("проверка «досмотрели» пропущена: %s", e)
+        await asyncio.sleep(st.cfg.rate_watch_minutes * 60)
 
 
 async def run() -> None:
@@ -1220,7 +1250,7 @@ async def run() -> None:
         BotCommand(command="voices", description="Любимые озвучки"),
         BotCommand(command="plot", description="Найти фильм по описанию сюжета"),
         BotCommand(command="delete", description="Удалить скачанное (освободить место)"),
-        BotCommand(command="ocenki", description="Что смотрели и наши оценки"),
+        BotCommand(command="ocenki", description="Что смотрели и оценки"),
         BotCommand(command="id", description="Мой Telegram ID"),
         BotCommand(command="start", description="Справка"),
     ])
@@ -1232,6 +1262,8 @@ async def run() -> None:
                                 "download-queue-size": max(cfg.queue_size, 1)})
     except Exception as e:
         log.warning("не удалось настроить очередь Transmission: %r", e)
+    if st.kodi and cfg.rate_watch_minutes > 0:
+        tasks.append(asyncio.create_task(rating_watch(bot, st)))
     if st.kodi and cfg.cleanup_days > 0:
         tasks.append(asyncio.create_task(cleaner(bot, st)))
         log.info("автоочистка: через %s дн. после просмотра", cfg.cleanup_days)

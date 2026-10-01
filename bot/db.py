@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS journal (
     rated_by   INTEGER,
     rated_at   INTEGER
 );
+CREATE TABLE IF NOT EXISTS ratings (
+    jid       INTEGER,
+    user_id   INTEGER,
+    score     INTEGER,          -- 1..10; NULL — «не смотрел(а)»
+    at        INTEGER,
+    PRIMARY KEY (jid, user_id)
+);
+CREATE TABLE IF NOT EXISTS rating_asks (
+    jid       INTEGER,
+    user_id   INTEGER,
+    reason    TEXT,             -- watched / delete / cleanup / pc / migrated
+    at        INTEGER,
+    PRIMARY KEY (jid, user_id, reason)
+);
 CREATE TABLE IF NOT EXISTS deletions (
     at        INTEGER,
     user_id   INTEGER,
@@ -87,7 +101,17 @@ class DB:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.c = sqlite3.connect(path, check_same_thread=False)
         self.c.row_factory = sqlite3.Row
+        tables = {r[0] for r in self.c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        migrate_ratings = "journal" in tables and "ratings" not in tables
+        if migrate_ratings and path != ":memory:":      # v6.5: копия базы перед переносом оценок
+            bak = sqlite3.connect(f"{path}.bak-6.4")
+            self.c.backup(bak)
+            bak.close()
         self.c.executescript(SCHEMA)
+        if migrate_ratings:                             # семейная оценка → личная оценка того, кто ставил
+            self.c.execute("INSERT OR IGNORE INTO ratings(jid, user_id, score, at)"
+                           " SELECT id, rated_by, rating, COALESCE(rated_at, added_at) FROM journal"
+                           " WHERE rating IS NOT NULL AND rated_by IS NOT NULL")
         # миграция: колонка poster появилась позже
         ucols = {r["name"] for r in self.c.execute("PRAGMA table_info(users)")}
         if "last_seen" not in ucols:
@@ -326,27 +350,62 @@ class DB:
                        (int(time.time()), uid, jid))
         self.c.commit()
 
-    def journal_rate(self, jid: int, rating: int | None, uid: int) -> bool:
-        cur = self.c.execute("UPDATE journal SET rating=?, rated_by=?, rated_at=? WHERE id=?",
-                             (rating, uid if rating else None, int(time.time()) if rating else None, jid))
-        self.c.commit()
-        return cur.rowcount > 0
-
     def journal_remove(self, jid: int) -> None:
         self.c.execute("UPDATE downloads SET jid=NULL WHERE jid=?", (jid,))
+        self.c.execute("DELETE FROM ratings WHERE jid=?", (jid,))
+        self.c.execute("DELETE FROM rating_asks WHERE jid=?", (jid,))
         self.c.execute("DELETE FROM journal WHERE id=?", (jid,))
         self.c.commit()
 
-    def journal(self, mode: str = "d") -> list[sqlite3.Row]:
-        """d — по дате (новые сверху), r — по оценке, u — только без оценки."""
-        when = "COALESCE(deleted_at, added_at)"
+    def journal(self, mode: str = "d", uid: int = 0) -> list[sqlite3.Row]:
+        """d — по дате (новые сверху), r — по средней оценке, u — «мне оценить» (uid ещё не ответил).
+        В каждой строке: avg (средняя), cnt (сколько оценок), answered/my — ответ uid."""
+        when = "COALESCE(j.deleted_at, j.added_at)"
+        q = ("SELECT j.*, AVG(r.score) AS avg, COUNT(r.score) AS cnt,"
+             " (SELECT score FROM ratings WHERE jid=j.id AND user_id=:u) AS my,"
+             " EXISTS(SELECT 1 FROM ratings WHERE jid=j.id AND user_id=:u) AS answered"
+             " FROM journal j LEFT JOIN ratings r ON r.jid=j.id GROUP BY j.id")
         if mode == "r":
-            q = f"SELECT * FROM journal WHERE rating IS NOT NULL ORDER BY rating DESC, {when} DESC"
+            q += f" HAVING cnt>0 ORDER BY avg DESC, cnt DESC, {when} DESC"
         elif mode == "u":
-            q = f"SELECT * FROM journal WHERE rating IS NULL ORDER BY {when} DESC"
+            q += f" HAVING answered=0 ORDER BY {when} DESC"
         else:
-            q = f"SELECT * FROM journal ORDER BY {when} DESC"
-        return self.c.execute(q).fetchall()
+            q += f" ORDER BY {when} DESC"
+        return self.c.execute(q, {"u": uid}).fetchall()
+
+    # --- личные оценки (v6.5) ---
+    def rate(self, jid: int, uid: int, score: int | None) -> None:
+        """score 1..10 или None — «не смотрел(а)»."""
+        self.c.execute("INSERT OR REPLACE INTO ratings(jid, user_id, score, at) VALUES (?,?,?,?)",
+                       (jid, uid, score, int(time.time())))
+        self.c.commit()
+
+    def unrate(self, jid: int, uid: int) -> bool:
+        """Сбросить СВОЙ ответ (чужие так не удалить)."""
+        cur = self.c.execute("DELETE FROM ratings WHERE jid=? AND user_id=?", (jid, uid))
+        self.c.commit()
+        return cur.rowcount > 0
+
+    def rating_of(self, jid: int, uid: int) -> sqlite3.Row | None:
+        return self.c.execute("SELECT * FROM ratings WHERE jid=? AND user_id=?", (jid, uid)).fetchone()
+
+    def ratings(self, jid: int) -> list[sqlite3.Row]:
+        """Все ответы по названию: сначала оценки (высокие сверху), потом «не смотрел(а)»."""
+        return self.c.execute("SELECT * FROM ratings WHERE jid=? ORDER BY score IS NULL, score DESC, at",
+                              (jid,)).fetchall()
+
+    def rating_summary(self, jid: int) -> tuple[float | None, int]:
+        row = self.c.execute("SELECT AVG(score), COUNT(score) FROM ratings WHERE jid=?", (jid,)).fetchone()
+        return row[0], row[1]
+
+    def was_asked(self, jid: int, uid: int) -> bool:
+        return self.c.execute("SELECT 1 FROM rating_asks WHERE jid=? AND user_id=?",
+                              (jid, uid)).fetchone() is not None
+
+    def note_ask(self, jid: int, uid: int, reason: str) -> None:
+        self.c.execute("INSERT OR IGNORE INTO rating_asks(jid, user_id, reason, at) VALUES (?,?,?,?)",
+                       (jid, uid, reason, int(time.time())))
+        self.c.commit()
 
     def get(self, h: str) -> sqlite3.Row | None:
         return self.c.execute("SELECT * FROM downloads WHERE hash=?", (h,)).fetchone()

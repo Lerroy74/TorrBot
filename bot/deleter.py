@@ -306,9 +306,7 @@ def build_router(st) -> Router:
         c = await card(lid, int(idx))
         if c:
             await edit(cb, *c)
-        row = st.db.journal_get(jid) if jid else None
-        if row is not None and not row["rating"]:
-            await journal.ask(bot, st, cb.message.chat.id, jid)
+        await journal.ask(bot, st, jid, cb.from_user.id, cb.message.chat.id, "pc", force=True)
 
     @r.callback_query(F.data.regexp(r"^ld:[0-9a-f]{8}:\d+:-?\d+$"))
     async def delete_ask(cb: CallbackQuery):
@@ -388,7 +386,9 @@ def build_router(st) -> Router:
         tail = f"\n💾 Свободно теперь: {fmt_size(free)}" if free is not None else ""
         await edit(cb, f"🗑 Удалено: <b>{esc(label[:150])}</b> ({fmt_size(e.size)}){tail}",
                    kb([[B(text="🗑 Удалить ещё", callback_data="lr")]]))
-        await journal.ask(bot, st, cb.message.chat.id, jid)
+        # оценку спрашиваем у того, кто удалил (всегда, если ещё не ответил), и у тех, кто качал (один раз)
+        await journal.ask(bot, st, jid, uid, cb.message.chat.id, "delete", force=True)
+        await journal.ask_many(bot, st, jid, sorted(owners), "delete")
         if st.kodi:
             asyncio.create_task(kodi_clean_later(st))
         who = short_name(st, uid) or str(uid)

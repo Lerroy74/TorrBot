@@ -48,6 +48,7 @@ class Config:
     cleanup_days: int
     cleanup_warn_hours: int
     cleanup_interval_hours: int
+    rate_watch_minutes: int
 
     queue_size: int
     health_interval: int
@@ -105,6 +106,7 @@ def load() -> Config:
         cleanup_days=int(_str("CLEANUP_DAYS", "0")),
         cleanup_warn_hours=int(_str("CLEANUP_WARN_HOURS", "24")),
         cleanup_interval_hours=int(_str("CLEANUP_INTERVAL_HOURS", "6")),
+        rate_watch_minutes=int(_str("RATE_WATCH_MINUTES", "30")),
         queue_size=int(_str("QUEUE_SIZE", "3")),
         health_interval=int(_str("HEALTH_INTERVAL", "300")),
         disk_warn_gb=float(_str("DISK_WARN_GB", "50")),

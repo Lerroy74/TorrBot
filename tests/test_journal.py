@@ -110,11 +110,11 @@ async def test_delete_asks_rating_and_ocenki(lib):
     await press(ALICE, btn(kb, "8").callback_data)
     assert "<b>8</b>/10" in last(session, ALICE)[1]
     j = st.db.journal()[0]
-    assert j["rating"] == 8 and j["rated_by"] == ALICE and j["deleted_at"]
+    assert st.db.rating_of(j["id"], ALICE)["score"] == 8 and j["deleted_at"]
 
     await send(BOB, "/ocenki")
     _, text, kb = last(session, BOB)
-    assert "Что смотрели" in text and "Маска (1994) — ⭐ <b>8</b>/10" in text and "средняя 8.0" in text
+    assert "Что смотрели" in text and "Маска (1994) — ⭐ <b>8.0</b> (1)" in text
     assert "💾" not in text.split("Маска")[1].split("\n")[0]
 
 
@@ -126,10 +126,11 @@ async def test_manual_file_and_skip(lib):
     await press(ADMIN, btn(last(session, ADMIN)[2], "Да").callback_data)
     _, ask, kb = last(session, ADMIN)
     assert "Old.Movie" in ask
-    await press(ADMIN, btn(kb, "Не смотрели").callback_data)
-    assert "без оценки" in last(session, ADMIN)[1]
+    await press(ADMIN, btn(kb, "Не смотрел").callback_data)
+    assert "не смотрел(а)" in last(session, ADMIN)[1]
     j = st.db.journal()
-    assert len(j) == 1 and j[0]["rating"] is None and j[0]["deleted_at"]
+    assert len(j) == 1 and j[0]["cnt"] == 0 and j[0]["deleted_at"]
+    assert st.db.rating_of(j[0]["id"], ADMIN)["score"] is None             # ответ записан
 
 
 async def test_season_delete_keeps_series_on_disk(lib):
@@ -148,19 +149,21 @@ async def test_ocenki_tabs_rate_from_list_and_admin_remove(lib):
     st, session, send, press, tr, movies, series = lib
     a = st.db.journal_note("movies", "Маска (1994)", None, ALICE)
     b = st.db.journal_note("series", "Во все тяжкие", None, BOB)
-    st.db.journal_rate(a, 6, ALICE)
+    st.db.rate(a, ALICE, 6)
     await send(ALICE, "/ocenki")
     _, text, kb = last(session, ALICE)
-    assert "без оценки" in text and "✍ Без оценки (1)" in [x.text for x in buttons(kb)]
+    assert "без оценок" in text and "ты: 6" in text and "✍ Мне оценить (1)" in [x.text for x in buttons(kb)]
     await press(ALICE, "jr:u:0")
     _, text, kb = last(session, ALICE)
     assert "Во все тяжкие" in text and "Маска" not in text
     await press(ALICE, btn(kb, "1").callback_data)                # карточка
     _, card, kb = last(session, ALICE)
-    assert "Оцени от 1 до 10" in card and not any("Убрать" in x.text for x in buttons(kb))
+    assert "Ты ещё не оценил" in card and not any("Убрать" in x.text for x in buttons(kb))
     await press(ALICE, next(x.callback_data for x in buttons(kb) if x.text == "10"))
-    _, text, kb = last(session, ALICE)
-    assert "Все оценены" in text                                   # вернулись в «без оценки»
+    _, card, kb = last(session, ALICE)
+    assert "Твоя оценка: <b>10</b>" in card and "Алиса 10" in card
+    await press(ALICE, "jr:u:0")
+    assert "Ты оценил(а) всё" in last(session, ALICE)[1]
     await press(ALICE, "jr:r:0")
     text = last(session, ALICE)[1]
     assert text.index("Во все тяжкие") < text.index("Маска")      # 10 выше 6
@@ -170,7 +173,58 @@ async def test_ocenki_tabs_rate_from_list_and_admin_remove(lib):
     await press(ADMIN, f"jq:{a}:d:0")
     await press(ADMIN, btn(last(session, ADMIN)[2], "Убрать").callback_data)
     await press(ADMIN, btn(last(session, ADMIN)[2], "Да").callback_data)
-    assert [r["id"] for r in st.db.journal()] == [b]
+    assert [r["id"] for r in st.db.journal()] == [b] and st.db.rating_of(a, ALICE) is None
+
+
+async def test_everyone_rates_own_and_resets_only_own(lib):
+    """v6.5: у каждого своя оценка, средняя по всем, «не смотрел» не считается, сброс — только свой."""
+    st, session, send, press, tr, movies, series = lib
+    a = st.db.journal_note("movies", "Маска (1994)", None, ALICE)
+    for uid, n in ((ALICE, "8"), (BOB, "7")):
+        await press(uid, f"jq:{a}:d:0")
+        await press(uid, next(x.callback_data for x in buttons(last(session, uid)[2]) if x.text == n))
+    await press(ADMIN, f"jq:{a}:d:0")
+    await press(ADMIN, btn(last(session, ADMIN)[2], "Не смотрел").callback_data)
+    _, card, kb = last(session, ADMIN)
+    assert "⭐ <b>7.5</b> (2)" in card and "Алиса 8" in card and "Боб 7" in card and "не смотрел(а)" in card
+    assert "Ты отметил(а): не смотрел(а)" in card
+    await press(BOB, f"rt:{a}:0:d:0")                              # Боб сбрасывает свою
+    assert st.db.rating_of(a, BOB) is None and st.db.rating_of(a, ALICE)["score"] == 8
+    assert st.db.rating_summary(a) == (8.0, 1)
+    await send(BOB, "/ocenki")
+    assert "✍ Мне оценить (1)" in [x.text for x in buttons(last(session, BOB)[2])]
+
+
+async def test_delete_asks_deleter_and_downloader(lib):
+    """Удаляет Боб фильм Алисы: вопрос обоим; Боб может ответить «не смотрел», удаление уже прошло."""
+    st, session, send, press, tr, movies, series = lib
+    st.db.journal_note("movies", "Маска (1994)", None, ALICE, h="a" * 40)
+    st.db.set_can_delete(BOB, True)
+    await send(BOB, "/delete")
+    await press(BOB, open_card(session, BOB, "Маска"))
+    await press(BOB, btn(last(session, BOB)[2], "Удалить").callback_data)
+    await press(BOB, btn(last(session, BOB)[2], "Да").callback_data)
+    assert not os.path.exists(f"{movies}/Маска (1994)")
+    assert "Как вам" in last(session, BOB)[1]
+    alice = [t for _, t, _ in session.sent(ALICE)]
+    assert any("Как вам" in t for t in alice) and any("удалил(а) скачанное" in t for t in alice)
+    await press(BOB, btn(last(session, BOB)[2], "Не смотрел").callback_data)
+    j = st.db.journal()[0]
+    assert st.db.rating_of(j["id"], BOB)["score"] is None and j["deleted_at"]
+
+
+def test_migration_from_family_rating(tmp_path):
+    """База v6.4: семейная оценка переезжает в личную оценку того, кто ставил; делается копия базы."""
+    path = str(tmp_path / "old.sqlite3")
+    d = DB(path)
+    a = d.journal_note("movies", "Маска (1994)", None, ALICE)
+    d.c.execute("UPDATE journal SET rating=9, rated_by=? WHERE id=?", (BOB, a))
+    d.c.execute("DROP TABLE ratings")
+    d.c.execute("DROP TABLE rating_asks")
+    d.c.commit()
+    d2 = DB(path)
+    assert d2.rating_of(a, BOB)["score"] == 9 and d2.rating_summary(a) == (9.0, 1)
+    assert os.path.exists(path + ".bak-6.4")
 
 
 async def test_ocenki_empty_and_not_allowed(lib):
