@@ -180,3 +180,34 @@ async def test_ocenki_empty_and_not_allowed(lib):
     n = len(session.calls)
     await send(999, "/ocenki")
     assert not any("Что смотрели" in t for _, t, _ in session.sent(999))
+
+
+# ---------- «◀ К вариантам» ----------
+async def test_back_to_choices(env):
+    st, session, send, press, mp = env
+    from bot import jacred
+    from test_flows import rel
+    cands = [mv(1, "Маска", "1994-07-29", orig="The Mask"), mv(3, "Маска 2", "2005-02-18")]
+
+    async def fake_find(st_, q):
+        return cands
+    mp.setattr(main, "find_info", fake_find)
+
+    async def fake_jac(http, cfg, q):
+        return [rel("Маска / The Mask (1994) BDRip 1080p", "1" * 40)] if "2" not in q else []
+    mp.setattr(jacred, "search", fake_jac)
+
+    await send(ALICE, "маска")
+    _, choice, kb = session.sent(ALICE)[-1]
+    await press(ALICE, next(b for b in buttons(kb) if "Маска (1994)" in b.text).callback_data)
+    _, listing, kb = session.sent(ALICE)[-1]
+    back = next(b for b in buttons(kb) if "К вариантам" in b.text)
+    await press(ALICE, back.callback_data)
+    _, again, kb2 = session.sent(ALICE)[-1]
+    assert again == choice and any("Маска 2" in b.text for b in buttons(kb2))
+    # второй вариант: раздач нет — кнопка «назад» всё равно есть
+    await press(ALICE, next(b for b in buttons(kb2) if "Маска 2" in b.text).callback_data)
+    _, none, kb3 = session.sent(ALICE)[-1]
+    assert "не нашлось" in none and any("К вариантам" in b.text for b in buttons(kb3))
+    await press(ALICE, "bk:deadbeef")
+    assert "устарел" in session.alerts()[-1]

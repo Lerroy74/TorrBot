@@ -41,6 +41,8 @@ class State:
         self.choices: dict[str, tuple[float, str, list[tmdb.Info], list[tmdb.Person]]] = {}
         self.hooks: dict = {}                    # функции роутера для extras (add_magnet, search_for…)
         self.infos: dict = {}                    # (kind, tmdb_id) → Info, для кнопок под обложкой
+        self.views: dict[str, tuple] = {}        # cid → (текст, кнопки, фото) списка вариантов — для «◀ К вариантам»
+        self.back: dict[str, str] = {}           # sid раздач → cid вариантов, откуда пришли
         self.casts: dict[tuple[bool, int], tuple[float, list[str]]] = {}   # актёры по (сериал?, id)
         self.health = extras.Health()
 
@@ -51,6 +53,7 @@ class State:
         now = time.time()
         for k in [k for k, v in self.searches.items() if now - v[0] > SEARCH_TTL]:
             del self.searches[k]
+            self.back.pop(k, None)
         sid = secrets.token_hex(4)
         self.searches[sid] = (now, query, results, info)
         return sid
@@ -59,9 +62,15 @@ class State:
         now = time.time()
         for k in [k for k, v in self.choices.items() if now - v[0] > SEARCH_TTL]:
             del self.choices[k]
+            self.views.pop(k, None)
         cid = secrets.token_hex(4)
         self.choices[cid] = (now, query, infos, persons)
         return cid
+
+    def remember(self, cid: str, text: str, kb: InlineKeyboardMarkup, photo: str | None = None) -> None:
+        """Запомнить список вариантов, чтобы из раздач можно было к нему вернуться."""
+        if cid in self.choices:
+            self.views[cid] = (text, kb, photo)
 
 
 async def send_with_poster(bot: Bot, st: State, chat_id: int, text: str, poster: str | None,
@@ -202,6 +211,9 @@ def render_page(st: State, sid: str, page: int) -> tuple[str, InlineKeyboardMark
         nav.append(InlineKeyboardButton(text="▶", callback_data=f"pg:{sid}:{page + 1}"))
     if nav:
         rows.append(nav)
+    back = st.back.get(sid)
+    if back and back in st.views:
+        rows.append([InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")])
     return "\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -716,9 +728,11 @@ def build_router(st: State) -> Router:
                 log.warning("не смог сообщить админу о закачке: %r", e)
 
     async def show_releases(msg: Message, label: str, results: list[jacred.Release],
-                            info: tmdb.Info | None, note: str = "") -> None:
+                            info: tmdb.Info | None, note: str = "", back: str | None = None) -> None:
         results = extras.order_for_user(st, msg.chat.id, results)
         sid = st.put_search(label, results, info)
+        if back:
+            st.back[sid] = back
         text, kb = render_page(st, sid, 0)
         if note:
             text = f"{note}\n\n{text}"
@@ -727,7 +741,13 @@ def build_router(st: State) -> Router:
                                    reply_markup=await extras.info_kb(st, info))
         await msg.answer(text, reply_markup=kb)
 
-    async def search_for(msg: Message, info: tmdb.Info) -> None:
+    def back_kb(back: str | None) -> InlineKeyboardMarkup | None:
+        if back and back in st.views:
+            return InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")]])
+        return None
+
+    async def search_for(msg: Message, info: tmdb.Info, back: str | None = None) -> None:
         """Раздачи для выбранного фильма: ищем по русскому и оригинальному
         названию, оставляем только то, что про этот фильм (название + год)."""
         label = tmdb.short_label(info, 80)
@@ -738,7 +758,8 @@ def build_router(st: State) -> Router:
         items = [it for res in found if not isinstance(res, BaseException) for it in res]
         if not items and all(isinstance(res, BaseException) for res in found):
             log.warning("jacred: %r", found)
-            await wait.edit_text("Поиск сейчас недоступен (jac.red не отвечает). Попробуй позже.")
+            await wait.edit_text("Поиск сейчас недоступен (jac.red не отвечает). Попробуй позже.",
+                                 reply_markup=back_kb(back))
             return
         results, total = jacred.select(items, cfg)
         exact = [x for x in results if tmdb.matches(info, x.title, x.is_series)]
@@ -750,11 +771,11 @@ def build_router(st: State) -> Router:
         else:
             hint = (f"Нашлось {total} раздач, но ни одна не подходит для приставки "
                     f"(4K/HEVC/слишком большие/мало сидов)." if total else "Раздач не нашлось.")
-            await wait.edit_text(f"{esc(label)}\n{hint}")
+            await wait.edit_text(f"{esc(label)}\n{hint}", reply_markup=back_kb(back))
             return
         await wait.delete()
         await cast_task
-        await show_releases(msg, label, results, info, note)
+        await show_releases(msg, label, results, info, note, back)
 
     async def raw_search(msg: Message, query: str) -> None:
         """Старый режим: текст как есть уходит на трекеры, обложка — догадка."""
@@ -803,6 +824,7 @@ def build_router(st: State) -> Router:
         head = f"👤 <b>{esc(person.name)}</b>" + (f" ({years})" if years else "")
         text, kb = render_choice(f"{head} — самое известное, где {role}:", infos, [], cid, None)
         photo = tmdb.person_photo(details) or person.photo
+        st.remember(cid, text, kb, photo)
         if not photo:
             await wait.edit_text(text, reply_markup=kb)
             return
@@ -842,6 +864,7 @@ def build_router(st: State) -> Router:
             return
         await add_cast(st, infos)
         t, kb = render_choice("📖 По описанию похоже на:", infos, [], cid, None)
+        st.remember(cid, t, kb)
         await wait.edit_text(t, reply_markup=kb)
 
     @r.message(Command("plot"))
@@ -893,6 +916,7 @@ def build_router(st: State) -> Router:
         extra = ([nav] if nav else []) + [[InlineKeyboardButton(text="🎲 Заново", callback_data="pb")]]
         head = f"🎲 <b>{esc(label)}</b>, стр. {page}" + ("" if infos else "\n\nНичего не нашлось — попробуй другие фильтры.")
         text, kb = render_choice(head, infos[:10], [], cid, None, extra_rows=extra)
+        st.remember(cid, text, kb)
         await cb.message.edit_text(text, reply_markup=kb)
 
     # ---------- выбор фильма ----------
@@ -912,13 +936,29 @@ def build_router(st: State) -> Router:
         except Exception:
             pass
         if parts[0] == "pk":
-            await search_for(cb.message, infos[int(parts[2])])
+            await search_for(cb.message, infos[int(parts[2])], back=parts[1])
         elif parts[0] == "pp":
             await show_person(cb.message, persons[int(parts[2])])
         elif parts[0] == "plot":
             await plot_search(cb.message, query)
         else:
             await raw_search(cb.message, query)
+
+    @r.callback_query(F.data.regexp(r"^bk:[0-9a-f]+$"))
+    async def back_to_choice(cb: CallbackQuery):
+        """«◀ К вариантам» — снова показать список фильмов, из которого выбирали."""
+        if not await guard_cb(cb):
+            return
+        view = st.views.get(cb.data[3:])
+        if not view:
+            await cb.answer("Список устарел, повтори поиск", show_alert=True)
+            return
+        await cb.answer()
+        text, kb, photo = view
+        if photo:
+            await send_with_poster(cb.bot, st, cb.message.chat.id, text, photo, reply_markup=kb)
+        else:
+            await cb.message.answer(text, reply_markup=kb)
 
     # ---------- magnet и поиск ----------
     @r.message(F.text.startswith("magnet:?"))
@@ -957,6 +997,7 @@ def build_router(st: State) -> Router:
         cid = st.put_choice(query, infos, persons)
         text, kb = render_choice(f"🔎 <b>{esc(query)}</b> — что именно ищем?", infos, persons, cid, query,
                                  plot=maybe_plot)
+        st.remember(cid, text, kb)
         await msg.answer(text, reply_markup=kb)
 
     r.include_router(deleter.build_router(st))
