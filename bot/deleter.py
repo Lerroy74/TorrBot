@@ -263,8 +263,17 @@ def build_router(st) -> Router:
         await cb.answer()
         await edit(cb, *got)
 
+    def journal_id(lid: str, e) -> int | None:
+        """Запись журнала для пункта /delete (создаётся, если положено руками)."""
+        inner, _ = library.torrents_for(e.path, libs[lid][2])
+        rows = [st.db.get(t["hashString"].lower()) for t in inner]
+        jid = next((r["jid"] for r in rows if r is not None and r["jid"]), None)
+        return jid or st.db.journal_note(e.kind, describe(st, e, libs[lid][2])[0])
+
     @r.callback_query(F.data.regexp(r"^lw:[0-9a-f]{8}:\d+$"))
-    async def watched_on_pc(cb: CallbackQuery, bot: Bot):
+    async def watched_on_pc(cb: CallbackQuery):
+        """«Посмотрели на ПК» в /delete: отметить в Kodi и сразу предложить удалить.
+        Оценку спросим после удаления (или после «Оставить»)."""
         if await refuse(cb):
             return
         _, lid, idx = cb.data.split(":")
@@ -274,15 +283,29 @@ def build_router(st) -> Router:
             return await _reload(cb)
         e = got[0]
         await cb.answer("Отмечаю…")
-        inner, _ = library.torrents_for(e.path, libs[lid][2])
-        rows = [st.db.get(t["hashString"].lower()) for t in inner]
-        rows = [r for r in rows if r is not None]
-        _, note = await journal.mark_on_pc(st, [e.path], auto=bool(rows))
-        got = await card(lid, int(idx))
-        await edit(cb, f"{note}\n\n{got[0]}" if got else note, got[1] if got else None)
-        jid = next((r["jid"] for r in rows if r["jid"]), None)
-        if not jid:
-            jid = st.db.journal_note(e.kind, describe(st, e, libs[lid][2])[0])
+        _, note = await journal.mark_on_pc(st, [e.path], auto=False)
+        note = note.split(" Положено не через бота")[0]          # хвост про автоочистку тут не к месту
+        label = esc(describe(st, e, libs[lid][2])[0][:120])
+        await edit(cb, f"{note}\n\nУдалить <b>{label}</b> сейчас?\n"
+                       f"Файлы ({fmt_size(e.size)}) удалятся с диска насовсем.",
+                   kb([[B(text="🗑 Да, удалить", callback_data=f"ly:{lid}:{idx}:-1"),
+                        B(text="Оставить", callback_data=f"lk:{lid}:{idx}")]]))
+
+    @r.callback_query(F.data.regexp(r"^lk:[0-9a-f]{8}:\d+$"))
+    async def keep_after_pc(cb: CallbackQuery, bot: Bot):
+        """«Оставить» после отметки — вернуть карточку и спросить оценку."""
+        if await refuse(cb):
+            return
+        _, lid, idx = cb.data.split(":")
+        got = pick(lid, int(idx), -1)
+        if not got:
+            await cb.answer("Список устарел — открываю заново")
+            return await _reload(cb)
+        await cb.answer()
+        jid = journal_id(lid, got[0])
+        c = await card(lid, int(idx))
+        if c:
+            await edit(cb, *c)
         row = st.db.journal_get(jid) if jid else None
         if row is not None and not row["rating"]:
             await journal.ask(bot, st, cb.message.chat.id, jid)

@@ -255,9 +255,26 @@ async def test_pc_from_delete_card(lib):
     assert st.kodi.calls == [("VideoLibrary.SetMovieDetails",
                               {"movieid": 7, "playcount": 1, "lastplayed": st.kodi.calls[0][1]["lastplayed"],
                                "resume": {"position": 0, "total": 0}})]
+    _, text, kb = last(session, ADMIN)
+    assert "Отметил в Kodi как просмотренное" in text and "Удалить" in text and "сейчас" in text
+    assert "Как вам" not in text and "Положено не через бота" not in text
+    await press(ADMIN, btn(kb, "Да, удалить").callback_data)      # v6.4.1: отметка → сразу удаление
+    assert not os.path.exists(f"{movies}/Маска (1994)") and tr.removed == ["a" * 40]
     texts = [t for _, t, _ in session.sent(ADMIN)]
-    assert any("Отметил в Kodi как просмотренное" in t for t in texts)
-    assert "Как вам" in texts[-1]                                  # и сразу просим оценку
+    assert any("🗑 Удалено" in t for t in texts) and "Как вам" in texts[-1]
+    assert sum("Как вам" in t for t in texts) == 1                 # оценку спросили один раз
+
+
+async def test_pc_from_delete_card_keep(lib):
+    st, session, send, press, tr, movies, series = lib
+    st.kodi = kodi_for(st, movies)
+    await send(ADMIN, "/delete")
+    await press(ADMIN, open_card(session, ADMIN, "Маска"))
+    await press(ADMIN, btn(last(session, ADMIN)[2], "Посмотрели на ПК").callback_data)
+    await press(ADMIN, btn(last(session, ADMIN)[2], "Оставить").callback_data)
+    texts = [t for _, t, _ in session.sent(ADMIN)]
+    assert "Как вам" in texts[-1] and "Маска (1994)" in texts[-2]
+    assert os.path.exists(f"{movies}/Маска (1994)") and not tr.removed
 
 
 async def test_pc_from_done_message_and_ocenki(lib):
