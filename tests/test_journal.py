@@ -211,3 +211,72 @@ async def test_back_to_choices(env):
     assert "не нашлось" in none and any("К вариантам" in b.text for b in buttons(kb3))
     await press(ALICE, "bk:deadbeef")
     assert "устарел" in session.alerts()[-1]
+
+
+# ---------- «✅ Посмотрели на ПК» ----------
+K = "smb://192.168.1.30/media"
+
+
+class PcKodi:
+    def __init__(self, items):
+        self.items, self.calls = items, []
+
+    async def videos(self):
+        return self.items
+
+    async def call(self, method, params=None):
+        self.calls.append((method, params))
+
+    async def mark_watched(self, items, when):
+        from bot.kodi import Kodi
+        return await Kodi.mark_watched(self, items, when)
+
+    async def clean(self):
+        pass
+
+
+def kodi_for(st, movies_dir):
+    rel_ = movies_dir[len(st.cfg.media_root.rstrip("/")):]
+    return PcKodi([
+        {"movieid": 7, "file": f"{K}{rel_}/Маска (1994)/The.Mask.1994.BDRip.mkv", "playcount": 0,
+         "lastplayed": "", "resume": {"position": 300}},
+        {"movieid": 8, "file": f"{K}{rel_}/Other.mkv", "playcount": 0, "lastplayed": "", "resume": {}}])
+
+
+async def test_pc_from_delete_card(lib):
+    st, session, send, press, tr, movies, series = lib
+    st.kodi = kodi_for(st, movies)
+    st.db.journal_note("movies", "Маска (1994)", None, ALICE, h="a" * 40)
+    await send(ADMIN, "/delete")
+    await press(ADMIN, open_card(session, ADMIN, "Маска"))
+    _, card, kb = last(session, ADMIN)
+    assert "Начали смотреть" in card
+    await press(ADMIN, btn(kb, "Посмотрели на ПК").callback_data)
+    assert st.kodi.calls == [("VideoLibrary.SetMovieDetails",
+                              {"movieid": 7, "playcount": 1, "lastplayed": st.kodi.calls[0][1]["lastplayed"],
+                               "resume": {"position": 0, "total": 0}})]
+    texts = [t for _, t, _ in session.sent(ADMIN)]
+    assert any("Отметил в Kodi как просмотренное" in t for t in texts)
+    assert "Как вам" in texts[-1]                                  # и сразу просим оценку
+
+
+async def test_pc_from_done_message_and_ocenki(lib):
+    st, session, send, press, tr, movies, series = lib
+    st.kodi = kodi_for(st, movies)
+    jid = st.db.journal_note("movies", "Маска (1994)", None, ALICE, h="a" * 40)
+    await press(ALICE, "pw:" + "a" * 40)
+    assert st.kodi.calls and st.kodi.calls[0][1]["movieid"] == 7
+    assert "Как вам" in last(session, ALICE)[1]
+    st.kodi.calls.clear()
+    await press(ALICE, f"jq:{jid}:d:0")
+    await press(ALICE, btn(last(session, ALICE)[2], "Посмотрели на ПК").callback_data)
+    assert st.kodi.calls[0][1]["movieid"] == 7 and "Отметил" in last(session, ALICE)[1]
+    await press(ALICE, "pw:" + "f" * 40)                         # чужой/несуществующий хэш
+    assert "нет на диске" in session.alerts()[-1]
+
+
+async def test_pc_not_in_library(lib):
+    st, session, send, press, tr, movies, series = lib
+    st.kodi = PcKodi([])
+    n, note = await __import__("bot.journal", fromlist=["x"]).mark_on_pc(st, [f"{movies}/Маска (1994)"])
+    assert n == 0 and "нет" in note and not st.kodi.calls

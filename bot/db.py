@@ -314,6 +314,10 @@ class DB:
             self.c.commit()
         return jid
 
+    def journal_downloads(self, jid: int) -> list[sqlite3.Row]:
+        """Раздачи этого названия, которые ещё на диске."""
+        return self.c.execute("SELECT * FROM downloads WHERE jid=? AND removed=0", (jid,)).fetchall()
+
     def journal_get(self, jid: int) -> sqlite3.Row | None:
         return self.c.execute("SELECT * FROM journal WHERE id=?", (jid,)).fetchone()
 

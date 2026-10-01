@@ -48,10 +48,15 @@ def _parse(ts: str) -> datetime | None:
         return None
 
 
+def items_under(root: str, items: list[dict]) -> list[dict]:
+    """Фильмы и серии медиатеки Kodi, чьи файлы лежат в root (файл или папка)."""
+    return [it for it in items
+            if any(f == root or f.startswith(root.rstrip("/") + "/") for f in _files_of(it))]
+
+
 def judge(root: str, items: list[dict]) -> Verdict:
     """root — путь закачки глазами Kodi (файл или папка)."""
-    mine = [it for it in items
-            if any(f == root or f.startswith(root.rstrip("/") + "/") for f in _files_of(it))]
+    mine = items_under(root, items)
     if not mine:
         return Verdict("not_in_library")
     watched = [it for it in mine if int(it.get("playcount") or 0) > 0]

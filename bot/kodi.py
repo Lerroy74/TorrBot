@@ -39,6 +39,21 @@ class Kodi:
     async def clean(self) -> None:
         await self.call("VideoLibrary.Clean", {"showdialogs": False})
 
+    async def mark_watched(self, items: list[dict], when: str) -> int:
+        """Отметить фильмы/серии просмотренными (как будто досмотрели на ТВ). when — «ГГГГ-ММ-ДД ЧЧ:ММ:СС»."""
+        n = 0
+        for it in items:
+            common = {"playcount": max(1, int(it.get("playcount") or 0)), "lastplayed": when,
+                      "resume": {"position": 0, "total": 0}}
+            if it.get("movieid"):
+                await self.call("VideoLibrary.SetMovieDetails", {"movieid": it["movieid"], **common})
+            elif it.get("episodeid"):
+                await self.call("VideoLibrary.SetEpisodeDetails", {"episodeid": it["episodeid"], **common})
+            else:
+                continue
+            n += 1
+        return n
+
     async def videos(self) -> list[dict]:
         """Все фильмы и серии медиатеки: file, playcount, lastplayed, resume."""
         props = ["file", "playcount", "lastplayed", "resume"]

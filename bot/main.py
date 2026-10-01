@@ -944,6 +944,28 @@ def build_router(st: State) -> Router:
         else:
             await raw_search(cb.message, query)
 
+    @r.callback_query(F.data.regexp(r"^pw:[0-9a-f]{40}$"))
+    async def watched_on_pc(cb: CallbackQuery):
+        """«✅ Посмотрели на ПК» под «Скачано»: отметить в Kodi, чтобы сработала автоочистка."""
+        if not await guard_cb(cb):
+            return
+        h = cb.data[3:]
+        row = st.db.get(h)
+        try:
+            torrents = await st.tr.get([h])
+        except Exception as e:
+            await cb.answer(f"Transmission не ответил: {e}", show_alert=True)
+            return
+        if row is None or row["removed"] or not torrents:
+            await cb.answer("Этого уже нет на диске", show_alert=True)
+            return
+        await cb.answer("Отмечаю…")
+        _, note = await journal.mark_on_pc(st, [_torrent_root(torrents[0])])
+        await cb.message.answer(note)
+        j = st.db.journal_get(row["jid"]) if row["jid"] else None
+        if j is not None and not j["rating"]:
+            await journal.ask(cb.bot, st, cb.message.chat.id, j["id"])
+
     @r.callback_query(F.data.regexp(r"^bk:[0-9a-f]+$"))
     async def back_to_choice(cb: CallbackQuery):
         """«◀ К вариантам» — снова показать список фильмов, из которого выбирали."""
@@ -1035,7 +1057,9 @@ async def watcher(bot: Bot, st: State):
                         bot, st, row["chat_id"],
                         f"✅ Скачано: {'📺' if series else '🎬'} <b>{esc(name[:200])}</b> "
                         f"({fmt_size(t['totalSize'])}){raw_line}\n"
-                        f"Уже можно смотреть на ТВ.", row["poster"])
+                        f"Уже можно смотреть на ТВ.", row["poster"],
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                            text=journal.PC_BUTTON, callback_data=f"pw:{h}")]]) if st.kodi else None)
             if finished_any and st.kodi:
                 asyncio.create_task(kodi_scan_later(st))
         except Exception as e:

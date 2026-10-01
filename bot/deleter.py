@@ -171,7 +171,8 @@ def build_router(st) -> Router:
         lines.append(f"👤 Поставил(а): {esc(', '.join(who))}" if who else "👤 Положено не через бота")
         if prog is not None:
             lines.append(f"⬇ Ещё качается ({prog * 100:.0f}%) — удаление отменит закачку")
-        text = "\n".join(lines) + await watched_line(e.path)
+        seen = await watched_line(e.path)
+        text = "\n".join(lines) + seen
         whole = "🗑 Удалить сериал целиком" if e.kind == "series" and e.is_dir else "🗑 Удалить"
         rows = [[B(text=f"{whole} ({fmt_size(e.size)})", callback_data=f"ld:{lid}:{idx}:-1")]]
         # отдельно — только папки, которые не часть общей раздачи на весь сериал
@@ -180,6 +181,8 @@ def build_router(st) -> Router:
             text += "\n\nМожно удалить отдельную папку (сезон):"
             for si, s in parts:
                 rows.append([B(text=f"🗑 {s.name[:40]} ({fmt_size(s.size)})", callback_data=f"ld:{lid}:{idx}:{si}")])
+        if st.kodi and seen and "Просмотрено" not in seen and "не ответил" not in seen:
+            rows.append([B(text=journal.PC_BUTTON, callback_data=f"lw:{lid}:{idx}")])
         rows.append([B(text="◀ К списку", callback_data=f"lb:{lid}:{idx // PAGE}")])
         return text, kb(rows)
 
@@ -259,6 +262,30 @@ def build_router(st) -> Router:
             return await _reload(cb)
         await cb.answer()
         await edit(cb, *got)
+
+    @r.callback_query(F.data.regexp(r"^lw:[0-9a-f]{8}:\d+$"))
+    async def watched_on_pc(cb: CallbackQuery, bot: Bot):
+        if await refuse(cb):
+            return
+        _, lid, idx = cb.data.split(":")
+        got = pick(lid, int(idx), -1)
+        if not got:
+            await cb.answer("Список устарел — открываю заново")
+            return await _reload(cb)
+        e = got[0]
+        await cb.answer("Отмечаю…")
+        inner, _ = library.torrents_for(e.path, libs[lid][2])
+        rows = [st.db.get(t["hashString"].lower()) for t in inner]
+        rows = [r for r in rows if r is not None]
+        _, note = await journal.mark_on_pc(st, [e.path], auto=bool(rows))
+        got = await card(lid, int(idx))
+        await edit(cb, f"{note}\n\n{got[0]}" if got else note, got[1] if got else None)
+        jid = next((r["jid"] for r in rows if r["jid"]), None)
+        if not jid:
+            jid = st.db.journal_note(e.kind, describe(st, e, libs[lid][2])[0])
+        row = st.db.journal_get(jid) if jid else None
+        if row is not None and not row["rating"]:
+            await journal.ask(bot, st, cb.message.chat.id, jid)
 
     @r.callback_query(F.data.regexp(r"^ld:[0-9a-f]{8}:\d+:-?\d+$"))
     async def delete_ask(cb: CallbackQuery):

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 from datetime import datetime
@@ -14,6 +15,8 @@ from datetime import datetime
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
+
+from . import cleanup
 
 log = logging.getLogger("torrbot")
 esc = html.escape
@@ -73,6 +76,44 @@ async def ask(bot, st, chat_id: int, jid: int | None) -> None:
         log.warning("не смог спросить оценку: %r", e)
 
 
+PC_BUTTON = "✅ Посмотрели на ПК"
+
+
+async def mark_on_pc(st, paths: list[str], auto: bool = True) -> tuple[int, str]:
+    """Смотрели не на ТВ (на ПК, в VLC и т.п.) — отметить в Kodi на малинке как просмотренное,
+    чтобы сработала автоочистка. (сколько отмечено, текст для пользователя)"""
+    cfg = st.cfg
+    if not st.kodi:
+        return 0, "Kodi не настроен — отметить негде."
+    roots = [k for k in (cleanup.to_kodi_path(p, cfg.media_root, cfg.kodi_media_url) for p in paths) if k]
+    if not roots:
+        return 0, "Это лежит не в медиатеке — отметить не могу."
+    try:
+        items = await asyncio.wait_for(st.kodi.videos(), 15)
+        mine, seen = [], set()
+        for root in roots:
+            for it in cleanup.items_under(root, items):
+                key = (it.get("movieid"), it.get("episodeid"))
+                if key not in seen:
+                    seen.add(key)
+                    mine.append(it)
+        if not mine:
+            return 0, "В медиатеке Kodi этого нет (ещё не появилось?) — отметить не могу."
+        n = await st.kodi.mark_watched(mine, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as e:
+        log.info("отметка «посмотрели на ПК»: %r", e)
+        return 0, "Kodi не ответил (малинка выключена?) — попробуй позже."
+    files = f"{n} серий" if n > 1 else "фильм"
+    if auto and cfg.cleanup_days:
+        tail = f"Через {cfg.cleanup_days} дн. удалю сам (админу сначала придёт предупреждение)."
+    elif auto:
+        tail = "Автоочистка выключена — само не удалится."
+    else:
+        tail = "Положено не через бота — само не удалится, только через /delete."
+    log.info("отмечено просмотренным в Kodi: %s (%d)", roots, n)
+    return n, f"✅ Отметил в Kodi как просмотренное ({files}). {tail}"
+
+
 def list_view(st, mode: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
     mode = mode if mode in MODES else "d"
     rows = st.db.journal(mode)
@@ -124,6 +165,8 @@ def card_view(st, row, mode: str, page: int, admin: bool) -> tuple[str, InlineKe
     extra = []
     if row["rating"]:
         extra.append(B(text="Сбросить оценку", callback_data=f"rt:{row['id']}:0{tail}"))
+    rows.append([B(text=PC_BUTTON, callback_data=f"jw:{row['id']}{tail}")]
+                if st.kodi and not row["deleted_at"] and st.db.journal_downloads(row["id"]) else [])
     if admin:
         extra.append(B(text="✖ Убрать из списка", callback_data=f"jx:{row['id']}{tail}"))
     rows += [extra, [B(text="◀ К списку", callback_data=f"jr:{mode}:{page}")]]
@@ -197,6 +240,24 @@ def build_router(st) -> Router:
         await cb.answer(f"⭐ {n}/10")
         await edit(cb, f"⭐ {icon(row)} <b>{esc(row['label'][:150])}</b> — <b>{n}</b>/10. "
                        f"Записал, весь список — /ocenki", None)
+
+    @r.callback_query(F.data.regexp(r"^jw:\d+:[dru]:\d+$"))
+    async def on_pc(cb: CallbackQuery):
+        if not allowed(cb.from_user.id):
+            return await cb.answer()
+        _, jid, mode, p = cb.data.split(":")
+        row = st.db.journal_get(int(jid))
+        rows = st.db.journal_downloads(int(jid)) if row is not None else []
+        if not rows:
+            return await cb.answer("Этого уже нет на диске", show_alert=True)
+        await cb.answer("Отмечаю…")
+        try:
+            torrents = await st.tr.get([r["hash"] for r in rows])
+        except Exception as e:
+            return await cb.message.answer(f"Transmission не ответил: {esc(str(e))}")
+        n, note = await mark_on_pc(st, [f"{(t.get('downloadDir') or '').rstrip('/')}/{t['name']}" for t in torrents])
+        text, markup = card_view(st, row, mode, int(p), cb.from_user.id in st.cfg.admin_ids)
+        await edit(cb, f"{note}\n\n{text}", markup)
 
     @r.callback_query(F.data.regexp(r"^jx:\d+:[dru]:\d+$"))
     async def remove_ask(cb: CallbackQuery):
