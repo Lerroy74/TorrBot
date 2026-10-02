@@ -469,4 +469,22 @@ def build_router(st) -> Router:
                 except Exception:
                     pass
 
+    async def ask_for_journal(jid: int, back: str) -> tuple[str, InlineKeyboardMarkup] | None:
+        """«🗑 Удалить с диска» из /ocenki и после оценки: найти на диске то, что скачано под этим
+        названием, и спросить подтверждение (дальше — обычное удаление /delete). back — куда «Нет»."""
+        hashes = {row["hash"].lower() for row in st.db.journal_downloads(jid)}
+        if not hashes:
+            return None
+        lid, entries, torrents = await load()
+        for idx, e in enumerate(entries):
+            inner, outer = library.torrents_for(e.path, torrents)
+            if outer or not hashes & {t["hashString"].lower() for t in inner}:
+                continue
+            label = esc(describe(st, e, torrents)[0][:120])
+            return (f"Удалить <b>{label}</b>?\nФайлы ({fmt_size(e.size)}) удалятся с диска насовсем.",
+                    kb([[B(text="🗑 Да, удалить", callback_data=f"ly:{lid}:{idx}:-1"),
+                         B(text="Нет", callback_data=back)]]))
+        return None
+
+    st.hooks["delete_for_journal"] = ask_for_journal
     return r

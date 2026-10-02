@@ -200,6 +200,15 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
     return picks.finish(text, numbers, "оценки всех и твоя оценка"), kb(rows + [nav] + tabs)
 
 
+DEL_BUTTON = "🗑 Удалить с диска"
+
+
+def may_delete_jid(st, row, uid: int) -> bool:
+    """Кнопка «Удалить с диска»: скачанное ещё лежит на диске, а у человека есть право удалять."""
+    return (row["src"] != "list" and not row["deleted_at"] and bool(st.db.journal_downloads(row["id"]))
+            and st.hooks.get("may_delete", lambda _: False)(uid))
+
+
 def card_view(st, row, mode: str, page: int, uid: int, admin: bool) -> tuple[str, InlineKeyboardMarkup]:
     jid = row["id"]
     lines = [f"{icon(row)} <b>{esc(row['label'][:150])}</b>"]
@@ -229,6 +238,8 @@ def card_view(st, row, mode: str, page: int, uid: int, admin: bool) -> tuple[str
     rows.append(extra)
     rows.append([B(text=PC_BUTTON, callback_data=f"jw:{jid}{tail}")]
                 if st.kodi and not row["deleted_at"] and st.db.journal_downloads(jid) else [])
+    if may_delete_jid(st, row, uid):
+        rows.append([B(text=DEL_BUTTON, callback_data=f"jd:{jid}{tail}")])
     if admin:
         rows.append([B(text="✖ Убрать из списка", callback_data=f"jx:{jid}{tail}")])
     rows.append([B(text="◀ К списку", callback_data=f"jr:{mode}:{page}")])
@@ -291,7 +302,10 @@ def build_router(st) -> Router:
             text = f"⭐ {name} — <b>{n}</b>/10. Записал."
         if cnt:
             text += f"\nСредняя сейчас {avg_text(avg, cnt)} — все оценки в /ocenki"
-        await edit(cb, text, None)
+        markup = None
+        if may_delete_jid(st, row, uid):          # посмотрели и оценили — можно сразу освободить место
+            markup = kb([[B(text=DEL_BUTTON, callback_data=f"jd:{row['id']}")]])
+        await edit(cb, text, markup)
 
     @r.callback_query(F.data.regexp(r"^rt:\d+:\d+(:[drmu]:\d+)?$"))
     async def rate(cb: CallbackQuery):
@@ -349,6 +363,25 @@ def build_router(st) -> Router:
         n, note = await mark_on_pc(st, [f"{(t.get('downloadDir') or '').rstrip('/')}/{t['name']}" for t in torrents])
         text, markup = card_for(st, row, mode, int(p), cb.from_user.id)
         await edit(cb, f"{note}\n\n{text}", markup)
+
+    @r.callback_query(F.data.regexp(r"^jd:\d+(:[drmu]:\d+)?$"))
+    async def delete_from_journal(cb: CallbackQuery):
+        """«🗑 Удалить с диска» — подтверждение и удаление как в /delete."""
+        uid = cb.from_user.id
+        parts = cb.data.split(":")
+        jid = int(parts[1])
+        row = st.db.journal_get(jid)
+        if row is None or not may_delete_jid(st, row, uid) or "delete_for_journal" not in st.hooks:
+            return await cb.answer("Удалить нельзя: уже нет на диске или нет права удалять", show_alert=True)
+        back = f"jq:{jid}:{parts[2]}:{parts[3]}" if len(parts) > 3 else f"jq:{jid}:d:0"
+        try:
+            view = await st.hooks["delete_for_journal"](jid, back)
+        except Exception as e:
+            return await cb.answer(f"Transmission не ответил: {e}", show_alert=True)
+        if not view:
+            return await cb.answer("Не нашёл это на диске — открой /delete", show_alert=True)
+        await cb.answer()
+        await edit(cb, *view)
 
     @r.callback_query(F.data.regexp(r"^jx:\d+:[drmu]:\d+$"))
     async def remove_ask(cb: CallbackQuery):

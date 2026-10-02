@@ -396,3 +396,27 @@ async def test_delete_sort_by_rating(lib):
     assert "Маска (1994)" in last(session, ADMIN)[1]
     await send(ADMIN, "/delete")                                       # выбор запомнился
     assert "худшие по оценке сверху" in last(session, ADMIN)[1]
+
+
+async def test_delete_from_ocenki_and_after_rating(lib):
+    """v8.2.4: «🗑 Удалить с диска» в карточке /ocenki и сразу после оценки."""
+    st, session, send, press, tr, movies, series = lib
+    jid = st.db.journal_note("movies", "Маска (1994)", None, ALICE, h="a" * 40)
+    await press(BOB, f"jq:{jid}:d:0")                              # у Боба права удалять нет
+    assert "Удалить с диска" not in [b.text for b in buttons(last(session, BOB)[2])]
+    st.db.set_can_delete(ALICE, True)
+    await press(ALICE, f"rt:{jid}:9")                              # оценил из вопроса
+    _, text, kb = last(session, ALICE)
+    assert "<b>9</b>/10" in text
+    await press(ALICE, btn(kb, "Удалить с диска").callback_data)
+    _, text, kb = last(session, ALICE)
+    assert "Удалить <b>Маска (1994)</b>?" in text
+    await press(ALICE, btn(kb, "Нет").callback_data)              # «Нет» — в карточку оценок
+    _, text, kb = last(session, ALICE)
+    assert "Твоя оценка: <b>9</b>" in text
+    await press(ALICE, btn(kb, "Удалить с диска").callback_data)
+    await press(ALICE, btn(last(session, ALICE)[2], "Да").callback_data)
+    assert any("🗑 Удалено: <b>Маска (1994)</b>" in t for _, t, _ in session.sent(ALICE))
+    assert not os.path.exists(os.path.join(movies, "Маска (1994)")) and st.db.journal_get(jid)["deleted_at"]
+    await press(ALICE, f"jq:{jid}:d:0")                            # уже удалено — кнопки нет
+    assert "Удалить с диска" not in [b.text for b in buttons(last(session, ALICE)[2])]
