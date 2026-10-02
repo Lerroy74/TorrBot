@@ -67,6 +67,15 @@ fi
 SNAP=$(sed -n 's/^Снимок текущей версии [^:]*: //p' "$LOG" | tail -1)
 rm -f "$WORK"
 
+# образ не изменился (та же версия) — compose контейнер не пересоздаёт; перезапустим сами,
+# иначе новый alive.json не появится и обновление ошибочно сочтётся неудачным
+st_at=$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)
+st_ts=$(date -d "$st_at" +%s 2>/dev/null || echo 0)
+if [ "$st_ts" -lt "$START" ]; then
+  echo "--- контейнер не пересоздан (образ тот же) — перезапускаю" >> "$LOG"
+  docker restart "$CONTAINER" >> "$LOG" 2>&1
+fi
+
 # ждём, что новый бот поднялся
 up=0; i=0
 while [ $i -lt "$WAIT" ]; do
@@ -84,13 +93,13 @@ if [ $up = 1 ]; then
 fi
 
 if [ $up != 1 ]; then
-  echo "--- бот не поднялся, логи:" >> "$LOG"
+  echo "--- бот не поднялся (alive.json: $(cat "$UPD/alive.json" 2>/dev/null)), логи бота:" >> "$LOG"
   (cd "$APP" && docker compose logs --tail 30 bot) >> "$LOG" 2>&1
   if [ -n "$SNAP" ] && [ -f "$SNAP" ]; then
     as_owner sh "$APP/rollback.sh" "$SNAP" >> "$LOG" 2>&1
-    result fail "↩ v$NEW не запустилась — вернул v$OLD.
-Последние строки лога бота:
-$(docker logs --tail 6 "$CONTAINER" 2>&1 | tail -6)
+    result fail "↩ v$NEW не запустилась за $WAIT с — вернул прежнюю (v$OLD).
+Конец лога обновления:
+$(grep -v '^[[:space:]]*$' "$LOG" | tail -n 12)
 Полный лог: ~/torrbot/data/update/last.log"
   else
     result fail "⚠ v$NEW не запустилась, а снимка для отката не нашёл! Нужна помощь руками: sh ~/torrbot/rollback.sh"
