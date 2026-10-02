@@ -39,6 +39,13 @@ class Kodi:
     async def clean(self) -> None:
         await self.call("VideoLibrary.Clean", {"showdialogs": False})
 
+    async def busy(self) -> bool:
+        """Идёт ли сейчас обновление или чистка медиатеки. Пока идёт — новую чистку Kodi отклонит
+        («CleanLibrary is not possible while scanning or cleaning»), причём молча, без ошибки в ответе."""
+        r = await self.call("XBMC.GetInfoBooleans",
+                            {"booleans": ["Library.IsScanningVideo", "Library.IsScanning"]}) or {}
+        return any(bool(v) for v in r.values())
+
     async def mark_watched(self, items: list[dict], when: str) -> int:
         """Отметить фильмы/серии просмотренными (как будто досмотрели на ТВ). when — «ГГГГ-ММ-ДД ЧЧ:ММ:СС»."""
         n = 0

@@ -47,25 +47,35 @@ def kodi_request(st, job: str, delay: float = 20) -> None:
 
 
 async def kodi_sync_once(st, now: float | None = None) -> list[str]:
-    """Выполнить созревшие задания. Вернёт выполненные."""
+    """Выполнить созревшие задания. Вернёт выполненные.
+    Kodi не умеет делать scan и clean одновременно: пока он занят, задания ждут, а за один заход
+    запускаем не больше одного задания — следующее пойдёт, когда Kodi закончит текущее."""
     now = now or time.time()
-    done = []
-    for job, due in sorted(st.kodi_jobs.items()):
-        if due > now:
-            continue
+    due = [job for job, t in sorted(st.kodi_jobs.items(), key=lambda kv: (kv[1], kv[0])) if t <= now]
+    if not due:
+        return []
+    busy = getattr(st.kodi, "busy", None)
+    if busy:
         try:
-            await (st.kodi.scan() if job == "scan" else st.kodi.clean())
-        except Exception as e:
-            st.kodi_jobs[job] = now + max(1, st.cfg.kodi_retry_min) * 60
-            log.info("Kodi: %s не удалось (%s) — повторю через %s мин", JOB_NAMES.get(job, job), e,
-                     st.cfg.kodi_retry_min)
-            continue
-        del st.kodi_jobs[job]
-        done.append(job)
-        log.info("Kodi: %s — запущено", JOB_NAMES.get(job, job))
-        if job == "clean" and "scan" in st.kodi_jobs:     # чистка и обновление разом Kodi не любит
-            st.kodi_jobs["scan"] = max(st.kodi_jobs["scan"], now + 30)
-    return done
+            if await busy():
+                for job in due:                          # Kodi ещё сканирует/чистит — подождём
+                    st.kodi_jobs[job] = now + 30
+                return []
+        except Exception:
+            pass                                         # не ответил — пусть ниже сработает обычный повтор
+    job = due[0]
+    try:
+        await (st.kodi.scan() if job == "scan" else st.kodi.clean())
+    except Exception as e:
+        st.kodi_jobs[job] = now + max(1, st.cfg.kodi_retry_min) * 60
+        log.info("Kodi: %s не удалось (%s) — повторю через %s мин", JOB_NAMES.get(job, job), e,
+                 st.cfg.kodi_retry_min)
+        return []
+    del st.kodi_jobs[job]
+    log.info("Kodi: %s — запущено", JOB_NAMES.get(job, job))
+    for other in st.kodi_jobs:                           # дать Kodi время отметиться как «занят»
+        st.kodi_jobs[other] = max(st.kodi_jobs[other], now + 30)
+    return [job]
 
 
 async def kodi_sync_loop(st) -> None:

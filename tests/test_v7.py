@@ -714,3 +714,28 @@ async def test_subscribe_old_download_does_not_redownload(env):
     assert list(st.tr.torrents) == [old]                     # ничего не поставил
     assert await subs.check_sub(bot, st, sub) == "без изменений"
     assert list(st.tr.torrents) == [old]
+
+
+async def test_kodi_jobs_wait_while_busy():
+    """Kodi сканирует — чистку не шлём (иначе «CleanLibrary is not possible while scanning»)."""
+    import types
+    calls = []
+
+    class K:
+        scanning = True
+        async def busy(self): return self.scanning
+        async def scan(self): calls.append("scan")
+        async def clean(self): calls.append("clean")
+
+    st = types.SimpleNamespace(kodi=K(), kodi_jobs={}, cfg=types.SimpleNamespace(kodi_retry_min=5))
+    now = time.time()
+    remote.kodi_request(st, "scan", delay=0)
+    remote.kodi_request(st, "clean", delay=0)
+    assert await remote.kodi_sync_once(st, now + 1) == [] and calls == []      # занят — ждём
+    st.kodi.scanning = False
+    assert await remote.kodi_sync_once(st, now + 40) == ["clean"]              # по одному за раз, сперва чистка
+    assert await remote.kodi_sync_once(st, now + 50) == []                     # пауза после запуска
+    st.kodi.scanning = True
+    assert await remote.kodi_sync_once(st, now + 80) == []                     # чистит — обновление ждёт
+    st.kodi.scanning = False
+    assert await remote.kodi_sync_once(st, now + 120) == ["scan"] and calls == ["clean", "scan"]
