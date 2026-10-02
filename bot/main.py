@@ -18,7 +18,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, CopyTextButton,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
-from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, picks,
+from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, nfo, picks,
                recs, remote, space, stall, subs, tmdb, wiki)
 from .access import DL, NO_DL, may_download
 from .access import AI as AI_FLAG
@@ -1426,8 +1426,10 @@ async def watch_once(bot: Bot, st: State) -> None:
             st.db.set_download(h, nospace_at=None)         # место освободили, закачка пошла
     await stall.check(bot, st, torrents, {h: r for h, r in pending.items()
                                           if h in torrents and torrents[h]["percentDone"] < 1})
-    if finished_any and st.kodi:
-        remote.kodi_request(st, "scan", delay=20)        # пока Transmission переносит файлы
+    if finished_any:                                      # v8.3: подсказки для Kodi, потом обновление медиатеки
+        if st.kodi:
+            remote.kodi_request(st, "scan", delay=60)    # запасной вариант, если подсказки задержатся
+        asyncio.create_task(nfo.sync_and_scan(st, delay=20))   # 20 с — пока Transmission переносит файлы
 
 
 async def watcher(bot: Bot, st: State):
@@ -1533,6 +1535,11 @@ async def cleanup_once(bot: Bot, st: State) -> None:
             await st.tr.remove(h, delete_data=True)
             st.db.mark_removed(h, "cleanup")
             removed_any = True
+            if row["label"]:                   # своя папка «Название (год)» — убрать оставшиеся .nfo
+                base = cfg.dir_series if row["category"] == "series" else cfg.dir_movies
+                await asyncio.sleep(2)
+                await asyncio.to_thread(nfo.tidy, f"{base.rstrip('/')}/{row['label']}",
+                                        (cfg.dir_movies, cfg.dir_series))
             log.info("автоочистка: удалено %s", t["name"])
             for a in cfg.admin_ids:
                 await bot.send_message(a, f"🗑 Удалил просмотренное: <b>{name}</b> "
@@ -1676,6 +1683,7 @@ async def run() -> None:
         tasks.append(asyncio.create_task(cleaner(bot, st)))
         log.info("автоочистка: через %s дн. после просмотра", cfg.cleanup_days)
     tasks.append(asyncio.create_task(updater.alive_loop(bot, st)))   # v8.2: «поднялся» — для обновления с сервера
+    tasks.append(asyncio.create_task(nfo.loop(st)))                  # v8.3: подсказки .nfo для Kodi
     try:
         await dp.start_polling(bot)
     finally:
