@@ -115,6 +115,13 @@ class Config:
     ai_total_day: int = 50             # ИИ-запросов в день на всех (0 — без лимита)
     ai_month_rub: float = 0            # месячный потолок, ₽ (0 — выкл)
     ai_prices: tuple = ()              # ((сервис, ₽ за 1000 токенов), …); не задано — сумму не считаем
+    # v8.2
+    itogi_day: int = 30                # «Итоги года»: рассылка такого-то декабря (0 — не рассылать)
+    itogi_hour: int = 19               # …в этот час
+    stt_max_sec: int = 30              # голосовые длиннее — не распознаём
+    stt_price: float = 0.1626          # ₽ за 15 секунд распознавания (прайс Яндекса 2026, с НДС)
+    listwatch_hours: float = 12        # как часто проверять раздачи для фильмов из списков
+    update_dir: str = "/data/update"   # куда бот кладёт архив для обновления (видит программа на сервере)
 
 
 def load() -> Config:
@@ -206,6 +213,12 @@ def load() -> Config:
         ai_user_day=int(_str("AI_USER_DAY", "10") or 0),
         ai_total_day=int(_str("AI_TOTAL_DAY", "50") or 0),
         ai_month_rub=float(_str("AI_MONTH_RUB", "0") or 0),
+        itogi_day=int(_str("ITOGI_DAY", "30") or 0),
+        itogi_hour=int(_str("ITOGI_HOUR", "19") or 19),
+        stt_max_sec=int(_str("STT_MAX_SEC", "30") or 30),
+        stt_price=float((_str("AI_PRICE_STT", "0.1626") or "0").replace(",", ".")),
+        listwatch_hours=float(_str("LISTWATCH_HOURS", "12") or 12),
+        update_dir=_str("UPDATE_DIR", "/data/update"),
         ai_prices=tuple((n, float(_str(f"AI_PRICE_{n.upper()}").replace(",", "."))) for n in ("yandex", "groq", "gemini")
                         if _str(f"AI_PRICE_{n.upper()}")),
     )

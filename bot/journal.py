@@ -19,7 +19,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import cleanup
+from . import cleanup, picks
 
 log = logging.getLogger("torrbot")
 esc = html.escape
@@ -184,7 +184,7 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
         disk = " · 💾 на диске" if not r["deleted_at"] else (" · 📋" if r["src"] == "list" else "")
         lines.append(f"<b>{i + 1}.</b> {icon(r)} {esc(r['label'][:70])} — {avg_text(r['avg'], r['cnt'])}{mine} · "
                      f"{day(r['deleted_at'] or r['added_at'])}{disk}")
-        btns.append(B(text=str(i + 1), callback_data=f"jq:{r['id']}:{mode}:{page}"))
+        btns.append((i + 1, str(i + 1), f"jq:{r['id']}:{mode}:{page}"))
     nav = []
     if page > 0:
         nav.append(B(text="◀", callback_data=f"jr:{mode}:{page - 1}"))
@@ -193,8 +193,11 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
     title = {"d": "новые сверху", "r": "лучшие сверху, без оценок — внизу",
              "m": "твои лучшие сверху", "u": "ты ещё не оценил(а)"}[mode]
     text = (f"{head}\n{MODES[mode]} — {title}" + (f", стр. {page + 1}/{pages}" if pages > 1 else "") +
-            "\n\n" + "\n".join(lines) + "\n\nНажми номер — оценки всех и твоя оценка.")
-    return text, kb([btns[j:j + 5] for j in range(0, len(btns), 5)] + [nav] + tabs)
+            "\n\n" + "\n".join(lines))
+    rows, numbers = picks.numbered(btns, 5, per_row=5)      # v8.1: много — номер текстом
+    if not numbers:
+        text += "\n\nНажми номер — оценки всех и твоя оценка."
+    return picks.finish(text, numbers, "оценки всех и твоя оценка"), kb(rows + [nav] + tabs)
 
 
 def card_view(st, row, mode: str, page: int, uid: int, admin: bool) -> tuple[str, InlineKeyboardMarkup]:

@@ -150,6 +150,49 @@ def _rank(r: Release, max_height: int) -> tuple:
     return (q, r.codec == "h264", r.seeders)
 
 
+_JUNK = ("camrip", "telesync", "tsrip", " ts ", "telecine", "trailer", "трейлер")
+
+
+def _best_key(r: Release) -> tuple:
+    return (r.height or 0, r.seeders >= 5, r.hdr, r.seeders)
+
+
+def best_any(items: list[dict], match=None, min_seeders: int = 1) -> Release | None:
+    """v8.2: лучшая раздача для magnet-ссылки — без ограничений приставки (4K, HDR, remux можно),
+    только отсекаем «экранки» и мёртвые раздачи. match(title, is_series) — та ли это раздача."""
+    best: Release | None = None
+    for it in items:
+        r = parse(it)
+        if not r or r.seeders < max(1, min_seeders):
+            continue
+        low = f" {r.title.lower()} "
+        if any(w in low for w in _JUNK):
+            continue
+        if match and not match(r.title, r.is_series):
+            continue
+        if best is None or _best_key(r) > _best_key(best):
+            best = r
+    return best
+
+
+def short_magnet(r: Release, limit: int = 256) -> str:
+    """Magnet не длиннее limit (кнопка «скопировать» в Telegram держит 256 символов):
+    хэш обязателен, дальше — трекеры из исходной ссылки, сколько влезет, потом имя."""
+    from urllib.parse import parse_qs, quote, urlsplit
+    out = f"magnet:?xt=urn:btih:{r.infohash}"
+    qs = parse_qs(urlsplit(r.magnet).query)
+    for tr in qs.get("tr", []):
+        add = "&tr=" + quote(tr, safe=":/")
+        if len(out) + len(add) <= limit:
+            out += add
+    name = re.sub(r"[^\w\s.\-()\[\]]", "", r.title)[:80].strip()
+    for n in range(len(name), 0, -1):
+        add = "&dn=" + quote(name[:n].strip())
+        if len(out) + len(add) <= limit:
+            return out + add
+    return out
+
+
 def select(items: list[dict], cfg: Config) -> tuple[list[Release], int]:
     """Возвращает (подходящие раздачи, сколько всего нашлось)."""
     best: dict[str, Release] = {}

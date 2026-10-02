@@ -15,14 +15,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery,
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, CopyTextButton,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
-from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, recs,
-               remote, space, stall, subs, tmdb, wiki)
+from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, picks,
+               recs, remote, space, stall, subs, tmdb, wiki)
 from .access import DL, NO_DL, may_download
 from .access import AI as AI_FLAG
 from . import guard as loadguard
+from . import inline, itogi, listwatch, updater, voice
 from .config import Config, load
 from .db import DB
 from .transmission import Transmission, TransmissionError
@@ -31,6 +32,7 @@ log = logging.getLogger("torrbot")
 esc = html.escape
 
 SEARCH_TTL = 3600  # сколько живут результаты поиска для кнопок
+PICK_AT = 3        # v8.1: больше стольких вариантов — без кнопки на каждый, выбор номером
 
 
 class State:
@@ -62,6 +64,7 @@ class State:
         # v8
         self.awaiting: dict[int, tuple] = {}      # uid → (время, что ждём текстом: название подборки/группы, запрос к ИИ)
         self.bot_username: str = ""
+        self.stt_http = None                      # v8.2: сессия для SpeechKit (голосовые)
 
     def is_allowed(self, uid: int) -> bool:
         return uid in self.cfg.admin_ids or uid in self.cfg.allowed_ids or self.db.is_allowed(uid)
@@ -91,24 +94,38 @@ class State:
 
 
 async def send_with_poster(bot: Bot, st: State, chat_id: int, text: str, poster: str | None,
-                           reply_markup: InlineKeyboardMarkup | None = None) -> None:
+                           reply_markup: InlineKeyboardMarkup | None = None) -> Message:
     """Сообщение с обложкой, а если с картинкой что-то не так — просто текстом.
     Сначала Telegram пробует забрать картинку по ссылке сам; не вышло — качаем её
     сами (через TMDB_PROXY, если задан) и загружаем файлом."""
     if poster and len(text) <= 1024:
         try:
-            await bot.send_photo(chat_id, poster, caption=text, reply_markup=reply_markup)
-            return
+            return await bot.send_photo(chat_id, poster, caption=text, reply_markup=reply_markup)
         except Exception as e:
             log.info("постер по ссылке не отправился (%r), пробую загрузить файлом", e)
         try:
             data = await tmdb.fetch_image(st.tmdb_http, poster)
-            await bot.send_photo(chat_id, BufferedInputFile(data, "poster.jpg"),
-                                 caption=text, reply_markup=reply_markup)
-            return
+            return await bot.send_photo(chat_id, BufferedInputFile(data, "poster.jpg"),
+                                        caption=text, reply_markup=reply_markup)
         except Exception as e:
             log.warning("постер не отправился: %r", e)
-    await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
+async def best_magnet(st: State, info: tmdb.Info) -> jacred.Release | None:
+    """v8.2: лучшая раздача фильма для magnet-ссылки (без фильтров приставки)."""
+    found = await asyncio.gather(*(jacred.search(st.http, st.cfg, q) for q in tmdb.tracker_queries(info)),
+                                 return_exceptions=True)
+    items = [it for res in found if not isinstance(res, BaseException) for it in res]
+    return jacred.best_any(items, lambda t, ser: tmdb.matches(info, t, ser), st.cfg.min_seeders)
+
+
+def magnet_row(rel: jacred.Release) -> list[InlineKeyboardButton]:
+    """Кнопка «скопировать magnet»: ссылку не видно, по нажатию она в буфере обмена.
+    На кнопке — качество лучшей раздачи."""
+    q = f"{rel.height}p" if rel.height else "?p"
+    label = f"📋 Magnet · {q}{' HDR' if rel.hdr else ''} · {rel.size_gb:.0f} ГБ · 👤{rel.seeders}"
+    return [InlineKeyboardButton(text=label, copy_text=CopyTextButton(text=jacred.short_magnet(rel)))]
 
 
 async def find_info(st: State, query: str) -> list[dict]:
@@ -212,13 +229,13 @@ def render_page(st: State, sid: str, page: int) -> tuple[str, InlineKeyboardMark
     page = max(0, min(page, pages - 1))
     chunk = results[page * ps:(page + 1) * ps]
     lines = [f"🔎 <b>{esc(query)}</b> — {len(results)} подходящих, стр. {page + 1}/{pages}\n"]
-    buttons = []
+    items = []
     for i, r in enumerate(chunk, start=page * ps + 1):
         kind = ("⭐ " if r.fav else "") + ("📺 " if r.is_series else "")
         voices = f"\n   🎙 {esc(', '.join(r.voices[:4]))}" if r.voices else ""
         lines.append(f"<b>{i}.</b> {kind}{esc(r.title[:200])}\n   <code>{esc(r.short_line())}</code>{voices}")
-        buttons.append(InlineKeyboardButton(text=f"⬇ {i}", callback_data=f"dl:{sid}:{i - 1}"))
-    rows = [buttons[j:j + 3] for j in range(0, len(buttons), 3)]
+        items.append((i, f"⬇ {i}", f"dl:{sid}:{i - 1}"))
+    rows, numbers = picks.numbered(items, PICK_AT, per_row=3)      # много — номер текстом, без кнопок
     if page == 0 and results:
         rows.insert(0, [InlineKeyboardButton(text="⚡ Лучшая раздача (№1)", callback_data=f"dl:{sid}:0")])
     nav = []
@@ -235,7 +252,7 @@ def render_page(st: State, sid: str, page: int) -> tuple[str, InlineKeyboardMark
     back = st.back.get(sid)
     if back and back in st.views:
         rows.append([InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")])
-    return "\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+    return picks.finish("\n\n".join(lines), numbers), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def fmt_day(ts: int | None) -> str:
@@ -254,7 +271,7 @@ def render_choice(title: str, infos: list[tmdb.Info], persons: list[tmdb.Person]
                   extra_rows: list | None = None) -> tuple[str, InlineKeyboardMarkup]:
     """Список «что именно смотреть» — кнопки фильмов/сериалов и людей."""
     lines = [title]
-    rows = []
+    items = []
     labels = [tmdb.short_label(inf) for inf in infos]
     for i, inf in enumerate(infos):
         extra = f" · ⭐ {inf.rating:.1f}" if inf.rating else ""
@@ -265,7 +282,8 @@ def render_choice(title: str, infos: list[tmdb.Info], persons: list[tmdb.Person]
         btn = f"{i + 1}. {labels[i]}"
         if labels.count(labels[i]) > 1 and inf.cast:        # одинаковые кнопки — добавим актёра
             btn += f" · {tmdb.surname(inf.cast[0])}"
-        rows.append([InlineKeyboardButton(text=btn, callback_data=f"pk:{cid}:{i}")])
+        items.append((i + 1, btn, f"pk:{cid}:{i}"))
+    rows, numbers = picks.numbered(items, PICK_AT)          # больше PICK_AT вариантов — выбор номером
     for i, p in enumerate(persons):
         role = {"Acting": "актёр", "Directing": "режиссёр"}.get(p.department, "")
         kf = f" — {esc(', '.join(p.known_for))}" if p.known_for else ""
@@ -278,7 +296,7 @@ def render_choice(title: str, infos: list[tmdb.Info], persons: list[tmdb.Person]
         rows.append([InlineKeyboardButton(text=f"🔎 Искать раздачи «{raw_query[:30]}» как есть",
                                           callback_data=f"raw:{cid}")])
     rows.extend(extra_rows or [])
-    return "\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+    return picks.finish("\n\n".join(lines), numbers), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------- /podbor: пошаговый подбор кнопками ----------
@@ -366,8 +384,9 @@ async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
     for i, u in enumerate(users, 1):
         name = u["name"] or str(u["id"])
         lines.append(f"<b>{i}. {esc(name)}</b> · <code>{u['id']}</code>\n" + user_stats(st, u, sizes))
-        btns.append(InlineKeyboardButton(text=f"⚙ {i}. {name.split(' (')[0][:16]}", callback_data=f"uc:{u['id']}"))
-    rows += [btns[j:j + 2] for j in range(0, len(btns), 2)]
+        btns.append((i, f"⚙ {i}. {name.split(' (')[0][:16]}", f"uc:{u['id']}"))
+    user_rows, numbers = picks.numbered(btns, 6, per_row=2)     # v8.1: много людей — номер текстом
+    rows += user_rows
     reqs = st.db.requests()
     if reqs:
         lines.append("⏳ <b>Ждут подтверждения:</b>")
@@ -388,7 +407,7 @@ async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="uref")])
     text = "\n\n".join(lines) + ("\n\n⚙ — права человека: качать, удалять, пульт, детский режим, ИИ, убрать доступ."
                                   if users else "")
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    return picks.finish(text, numbers, "права человека"), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def user_card(st: State, uid: int) -> tuple[str, InlineKeyboardMarkup] | None:
@@ -445,12 +464,16 @@ def build_router(st: State) -> Router:
         if not may_download(st, uid):                  # v8: лёгкий режим — списки и подбор
             return ("Я помогаю выбрать, что посмотреть:\n"
                     "• напиши название фильма или имя актёра — покажу карточку, её можно добавить в список "
-                    "(«➕ В список») и оценить;\n"
+                    "(«➕ В список») и оценить, а «📋 Magnet» скопирует ссылку на лучшую раздачу "
+                    "для твоего торрент-клиента;\n"
+                    "• можно голосовым — просто скажи название;\n"
+                    "• в любом чате: <i>@бот название</i> — отправить карточку фильма другу;\n"
                     "• описание сюжета — <i>/plot мужик находит маску и становится зелёным</i>;\n"
                     "• /podbor — подобрать по жанру, годам и стране;\n"
                     "• /sovet — что посмотреть: похожее на любимое, вместе с группой, по запросу;\n"
                     "• /random — случайный фильм.\n\n"
                     "/lists — мои списки и подборки, списки групп\n"
+                    "/itogi — итоги года\n"
                     "/gruppy — группы с семьёй и друзьями (общие списки)\n"
                     "/ocenki — мои оценки\n"
                     "/id — твой Telegram ID")
@@ -462,8 +485,10 @@ def build_router(st: State) -> Router:
                 "• /sovet — что посмотреть: похожее на любимое, вместе с группой, по запросу;\n"
                 "• /random — что посмотреть сегодня;\n"
                 "• /voices — любимые озвучки: такие раздачи будут первыми со ⭐;\n"
-                "• magnet-ссылку — поставлю сразу.\n\n"
+                "• magnet-ссылку — поставлю сразу;\n"
+                "• голосовое — скажи название; в любом чате <i>@бот название</i> — отправить фильм другу.\n\n"
                 "/lists — мои списки и подборки, списки групп (/want)\n"
+                "/itogi — итоги года\n"
                 "/gruppy — группы с семьёй и друзьями\n"
                 "/status — что сейчас качается (там же можно отменить)\n"
                 + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](uid) else "")
@@ -480,6 +505,8 @@ def build_router(st: State) -> Router:
             st.db.touch(u.id)
             if arg[:2] in ("g_", "l_"):                # v8: приглашение в группу / открытый список
                 await msg.answer(await lists.accept_invite(bot, st, u.id, arg))
+                return
+            if await inline.open_from_start(st, msg, u.id, arg):     # v8.2: «Открыть в боте» из инлайна
                 return
             await msg.answer(help_text(u.id))
             return
@@ -917,10 +944,15 @@ def build_router(st: State) -> Router:
             rows.append([InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")])
         return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-    async def show_card(msg: Message, info: tmdb.Info, uid: int, head: str = "", extra: list | None = None) -> None:
+    async def show_card(msg: Message, info: tmdb.Info, uid: int, head: str = "", extra: list | None = None,
+                        magnet: bool = False) -> None:
         """v8: карточка фильма (обложка, описание, трейлер, «➕ В список», «⭐ Оценить»).
-        Тем, кто может качать, — ещё «⬇ Найти раздачи»."""
+        Тем, кто может качать, — ещё «⬇ Найти раздачи».
+        v8.2: magnet=True (поиск в лёгком режиме) — параллельно ищем лучшую раздачу и, когда
+        найдётся, добавляем сверху кнопку «📋 Magnet» (копирует ссылку для своего торрент-клиента)."""
         lists.remember_info(st, info)
+        mtask = (asyncio.create_task(best_magnet(st, info))
+                 if magnet and not may_download(st, uid) and not kids.is_kid(st, uid) else None)
         kind = "t" if info.is_tv else "m"
         markup = await extras.info_kb(st, info, uid)
         rows = list(markup.inline_keyboard) if markup else []
@@ -929,8 +961,20 @@ def build_router(st: State) -> Router:
         rows += extra or []
         await add_cast(st, [info])
         text = (f"{head}\n\n" if head else "") + info.caption(500 if head else 600)
-        await send_with_poster(msg.bot, st, msg.chat.id, text, info.poster,
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+        sent = await send_with_poster(msg.bot, st, msg.chat.id, text, info.poster,
+                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+        if mtask:
+            try:
+                rel = await mtask
+            except Exception as e:
+                log.info("magnet: %r", e)
+                rel = None
+            if rel and sent:
+                try:
+                    await sent.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[magnet_row(rel)] + rows))
+                except Exception as e:
+                    log.info("magnet: кнопку не добавить: %r", e)
 
     async def search_for(msg: Message, info: tmdb.Info, back: str | None = None, uid: int | None = None) -> None:
         """Раздачи для выбранного фильма: ищем по русскому и оригинальному
@@ -940,7 +984,7 @@ def build_router(st: State) -> Router:
         if not may_download(st, uid):
             extra = ([[InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")]]
                      if back and back in st.views else None)
-            await show_card(msg, info, uid, extra=extra)
+            await show_card(msg, info, uid, extra=extra, magnet=True)
             return
         label = tmdb.short_label(info, 80)
         wait = await msg.answer(f"🔎 Ищу раздачи: {esc(label)}…")
@@ -1245,32 +1289,41 @@ def build_router(st: State) -> Router:
         await add_magnet(msg, msg.from_user.id, msg.text.strip(), "magnet-ссылка", False)
 
     @r.message(F.text & ~F.text.startswith("/"))
-    async def search(msg: Message):
+    async def search(msg: Message, dispatcher: Dispatcher):
         if not await guard(msg):
             return
         if "text_input" in st.hooks and await st.hooks["text_input"](msg):     # v8: ждали название / запрос к ИИ
             return
-        query = msg.text.strip()[:100]
+        data = picks.lookup(msg.chat.id, msg.text)            # v8.1: «5» — выбор номера из последнего списка
+        if data:
+            await picks.dispatch(msg, data, dispatcher)
+            return
+        await text_query(msg, msg.text, msg.from_user.id)
+
+    async def text_query(msg: Message, text: str, uid: int) -> None:
+        """Обычный запрос: название, актёр или описание сюжета (v8.2: и распознанное голосовое)."""
+        full = text.strip()
+        query = full[:100]
         if not cfg.tmdb_key:
-            await raw_search(msg, query, msg.from_user.id)
+            await raw_search(msg, query, uid)
             return
         cands = await find_info(st, query)
         if tmdb.is_person_query(query, cands):
             await show_person(msg, tmdb.people(cands, 1)[0])
             return
         _, year = tmdb.split_query(query)
-        infos = kids.only_kids(st, msg.from_user.id, tmdb.choices(cands, year, 20))[:6]
+        infos = kids.only_kids(st, uid, tmdb.choices(cands, year, 20))[:6]
         persons = tmdb.people(cands)
         # длинный запрос может быть описанием сюжета, а не названием
         maybe_plot = len(wiki.keywords(query)) >= 3
         if len(infos) == 1 and not persons and not maybe_plot:
-            await search_for(msg, infos[0], uid=msg.from_user.id)
+            await search_for(msg, infos[0], uid=uid)
             return
         if not infos and not persons:
             if maybe_plot:
-                await plot_search(msg, query, msg.from_user.id)   # похоже на описание — ищем по сюжету
+                await plot_search(msg, full[:300], uid)   # похоже на описание — ищем по сюжету
             else:
-                await raw_search(msg, query, msg.from_user.id)    # TMDB не знает — ищем как есть
+                await raw_search(msg, query, uid)    # TMDB не знает — ищем как есть
             return
         await add_cast(st, infos)
         cid = st.put_choice(query, infos, persons)
@@ -1304,7 +1357,13 @@ def build_router(st: State) -> Router:
     r.include_router(lists.build_router(st))
     r.include_router(recs.build_router(st))
     r.include_router(aictl.build_router(st))
-    st.hooks.update(add_magnet=add_magnet, search_for=search_for, can_cancel=can_cancel, show_card=show_card,
+    r.include_router(inline.build_router(st))
+    r.include_router(itogi.build_router(st))
+    r.include_router(voice.build_router(st))
+    r.include_router(updater.build_router(st))
+    st.hooks.update(find_info=lambda q: find_info(st, q), text_query=text_query,
+                    info_for=lambda kind, tid: lists.info_for(st, kind, tid, full=True),
+                    add_magnet=add_magnet, search_for=search_for, can_cancel=can_cancel, show_card=show_card,
                     may_download=lambda uid: may_download(st, uid),
                     send_with_poster=send_with_poster,
                     enqueue=lambda bot, **kw: enqueue(bot, **kw),
@@ -1556,6 +1615,7 @@ async def run() -> None:
     if cfg.gemini_key:
         ai_sessions["gemini"] = session_for(cfg.gemini_proxy)
     st.ai = ai.Chain(cfg, ai_sessions)
+    st.stt_http = ai_sessions.get("yandex")                         # v8.2: голосовые — тоже Яндекс, напрямую
     aictl.apply(st)                                # выключенные в /ai сервисы
     try:
         lists.setup(st)                            # v8: «Хотим посмотреть» → группа «Семья» (один раз)
@@ -1573,6 +1633,7 @@ async def run() -> None:
 
     bot = Bot(cfg.bot_token, session=AiohttpSession(proxy=cfg.tg_proxy),
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    picks.install(bot)                             # v8.1: выбор номером вместо длинных клавиатур
     dp = Dispatcher()
     dp.include_router(extras.build_router(st))
     dp.include_router(build_router(st))
@@ -1583,6 +1644,7 @@ async def run() -> None:
         BotCommand(command="sovet", description="Что посмотреть: похожее, вместе, по запросу"),
         BotCommand(command="gruppy", description="Группы: семья, друзья"),
         BotCommand(command="random", description="Что посмотреть сегодня"),
+        BotCommand(command="itogi", description="Итоги года: что посмотрели, лучшее"),
         BotCommand(command="voices", description="Любимые озвучки"),
         BotCommand(command="plot", description="Найти фильм по описанию сюжета"),
         BotCommand(command="delete", description="Удалить скачанное (освободить место)"),
@@ -1603,6 +1665,8 @@ async def run() -> None:
     except Exception as e:
         log.warning("не удалось настроить очередь Transmission: %r", e)
     tasks.append(asyncio.create_task(subs.loop(bot, st)))
+    tasks.append(asyncio.create_task(itogi.loop(bot, st)))
+    tasks.append(asyncio.create_task(listwatch.loop(bot, st)))
     tasks.append(asyncio.create_task(loadguard.guard_loop(bot, st)))
     if st.kodi:
         tasks.append(asyncio.create_task(remote.kodi_sync_loop(st)))
@@ -1611,6 +1675,7 @@ async def run() -> None:
     if st.kodi and cfg.cleanup_days > 0:
         tasks.append(asyncio.create_task(cleaner(bot, st)))
         log.info("автоочистка: через %s дн. после просмотра", cfg.cleanup_days)
+    tasks.append(asyncio.create_task(updater.alive_loop(bot, st)))   # v8.2: «поднялся» — для обновления с сервера
     try:
         await dp.start_polling(bot)
     finally:

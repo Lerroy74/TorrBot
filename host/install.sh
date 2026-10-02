@@ -4,6 +4,8 @@
 # 1. Сторож сервера (host-watch.sh): туннель и контейнер бота, раз в 3 минуты, пишет в Telegram напрямую.
 # 2. Агент нагрузки (load-agent.py, v7): диск, сеть, просмотр по сети, SMART — каждые 5 секунд
 #    в ~/torrbot/data/host-load.json; по этим данным бот тормозит закачки и предупреждает админа.
+# 3. Программа обновления (update-agent.sh, v8.2): ставит архив, присланный боту в Telegram,
+#    проверяет, что новый бот поднялся, иначе откатывает; при успехе — git push.
 # Программы копируются в /usr/local/bin (откат бота rollback.sh их не заденет).
 set -e
 [ "$(id -u)" = 0 ] || { echo "Запусти через sudo: sudo sh $0"; exit 1; }
@@ -61,7 +63,35 @@ Nice=10
 WantedBy=multi-user.target
 UNIT
 
+# ---------- 3. программа обновления (v8.2) ----------
+OWNER=$(stat -c %U "$APP")
+install -m 755 "$DIR/update-agent.sh" /usr/local/bin/torrbot-update-agent
+mkdir -p "$APP/data/update"
+cat > /etc/systemd/system/torrbot-update.service <<UNIT
+[Unit]
+Description=torrbot: обновление по заявке из Telegram (deploy, проверка, откат, git push)
+
+[Service]
+Type=oneshot
+Environment=TORRBOT_DIR=$APP WATCH_ENV=$ENV_FILE TORRBOT_OWNER=$OWNER
+ExecStart=/usr/local/bin/torrbot-update-agent
+TimeoutStartSec=20min
+UNIT
+cat > /etc/systemd/system/torrbot-update.path <<UNIT
+[Unit]
+Description=torrbot: ждать заявку на обновление от бота
+
+[Path]
+PathExists=$APP/data/update/request.json
+Unit=torrbot-update.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+printf '{"installed": "%s"}\n' "$(date '+%d.%m.%Y %H:%M')" > "$APP/data/update/agent.json"
+
 systemctl daemon-reload
+systemctl enable --now torrbot-update.path
 systemctl enable --now torrbot-host-watch.timer
 systemctl enable torrbot-load-agent.service >/dev/null 2>&1
 systemctl restart torrbot-load-agent.service
@@ -71,3 +101,7 @@ systemctl list-timers torrbot-host-watch.timer --no-pager | head -3
 echo "--- агент нагрузки: один замер ---"
 /usr/bin/python3 /usr/local/bin/torrbot-load-agent --env "$ENV_FILE" --once
 systemctl is-active torrbot-load-agent.service
+echo "--- обновление из Telegram ---"
+systemctl is-active torrbot-update.path && echo "Ждёт архив: пришли боту torrbot-vX.Y.zip (только админ), /update — состояние"
+[ -d "$APP/.git" ] && echo "git: после удачного обновления — commit и push от имени $OWNER" \
+  || echo "git: $APP — не репозиторий, пушить не буду"

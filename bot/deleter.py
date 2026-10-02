@@ -20,7 +20,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import cleanup, journal, library
+from . import cleanup, journal, library, picks
 
 log = logging.getLogger("torrbot")
 esc = html.escape
@@ -153,8 +153,8 @@ def build_router(st) -> Router:
                     (f" · ⬇ {prog * 100:.0f}%" if prog is not None else "")
             lines.append(f"<b>{i + 1}.</b> {'📺' if e.kind == 'series' else '🎬'} {esc(label[:70])}"
                          f" · {fmt_size(e.size)}{extra}")
-            btns.append(B(text=str(i + 1), callback_data=f"li:{lid}:{i}"))
-        rows = [btns[j:j + 4] for j in range(0, len(btns), 4)]
+            btns.append((i + 1, str(i + 1), f"li:{lid}:{i}"))
+        rows, numbers = picks.numbered(btns, 5, per_row=5)  # v8.1: много — номер текстом
         nav = []
         if page > 0:
             nav.append(B(text="◀", callback_data=f"lb:{lid}:{page - 1}"))
@@ -162,6 +162,8 @@ def build_router(st) -> Router:
             nav.append(B(text="▶", callback_data=f"lb:{lid}:{page + 1}"))
         rows.append(nav)
         rows.append([B(text=("• " if m == mode else "") + t, callback_data=f"ls:{lid}:{m}") for m, t in SORTS.items()])
+        if numbers:
+            return picks.finish(lines[0] + "\n\n" + "\n".join(lines[1:]), numbers, "подробности и удаление"), kb(rows)
         return (lines[0] + "\n\n" + "\n".join(lines[1:]) +
                 "\n\nНажми номер — покажу подробности и спрошу, удалять ли."), kb(rows)
 

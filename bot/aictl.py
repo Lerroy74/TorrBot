@@ -24,7 +24,8 @@ from .access import AI as AI_FLAG
 log = logging.getLogger("torrbot")
 esc = html.escape
 
-FEATURES = {"plot": "🔎 Поиск по описанию (/plot)", "rec": "🤖 Подбор по запросу (/sovet)"}
+FEATURES = {"plot": "🔎 Поиск по описанию (/plot)", "rec": "🤖 Подбор по запросу (/sovet)",
+            "voice": "🎤 Голосовые (SpeechKit)"}
 USER_STEPS = [0, 3, 5, 10, 20, 50]
 TOTAL_STEPS = [0, 20, 50, 100, 200, 500]
 CAP_STEPS = [0, 100, 300, 500, 1000, 2000]
@@ -85,12 +86,18 @@ def prices(st) -> dict[str, float]:
     return dict(st.cfg.ai_prices)
 
 
+def row_cost(st, r) -> float:
+    """₽ за строку расхода. v8.2: у распознавания речи (stt) tin — число 15-секундных отрезков."""
+    if r["provider"] == "stt":
+        return r["tin"] * st.cfg.stt_price
+    return (r["tin"] + r["tout"]) / 1000 * prices(st).get(r["provider"], 0)
+
+
 def cost(st, prefix: str) -> float | None:
     """Примерная сумма в ₽ за день/месяц. None — ни у одного сервиса не задана цена."""
-    pr = prices(st)
-    if not pr:
+    if not prices(st) and not st.cfg.stt_price:
         return None
-    return sum((r["tin"] + r["tout"]) / 1000 * pr.get(r["provider"], 0) for r in st.db.ai_usage(prefix))
+    return sum(row_cost(st, r) for r in st.db.ai_usage(prefix))
 
 
 def capped(st) -> bool:
@@ -181,6 +188,12 @@ def usage_lines(st, prefix: str) -> list[str]:
     for r in rows:
         by.setdefault(r["provider"], []).append(r)
     out = []
+    stt = by.pop("stt", None)
+    if stt:
+        req = sum(r["req"] for r in stt)
+        sec = sum(r["tout"] for r in stt)
+        rub = f" ≈ {sum(row_cost(st, r) for r in stt):.2f} ₽" if st.cfg.stt_price else ""
+        out.append(f"   🎤 SpeechKit: {req} голос. ({sec} с){rub}")
     for prov, items in by.items():
         req = sum(r["req"] for r in items)
         tok = sum(r["tin"] + r["tout"] for r in items)
@@ -207,6 +220,8 @@ def panel(st) -> tuple[str, InlineKeyboardMarkup]:
     cap, spent = month_cap(st), cost(st, month())
     money = (f"≈ {spent:.2f} ₽ за месяц" if spent is not None
              else "цены не заданы (AI_PRICE_YANDEX и др. в .env) — сумму не считаю")
+    if spent is not None and not prices(st):
+        money += " (только голосовые: цены ИИ — AI_PRICE_YANDEX и др. — не заданы)"
     lines.append(f"Потолок: {f'{cap:g} ₽/мес' if cap else 'выкл'} · {money}")
     if capped(st):
         lines.append("⛔ <b>Потолок достигнут — ИИ выключен до конца месяца.</b>")
@@ -245,7 +260,7 @@ def build_router(st) -> Router:
         text, markup = panel(st)
         await msg.answer(text, reply_markup=markup)
 
-    @r.callback_query(F.data.regexp(r"^A:(f:(plot|rec)|p:[a-z]+|[wutcor])$"))
+    @r.callback_query(F.data.regexp(r"^A:(f:(plot|rec|voice)|p:[a-z]+|[wutcor])$"))
     async def ai_cb(cb: CallbackQuery):
         if cb.from_user.id not in st.cfg.admin_ids:
             return await cb.answer("Только для администратора", show_alert=True)

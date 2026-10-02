@@ -24,7 +24,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import tmdb
+from . import picks, tmdb
 from .access import NO_DL, may_download
 
 log = logging.getLogger("torrbot")
@@ -172,13 +172,13 @@ async def info_for(st, kind: str, tid: int, full: bool = False) -> tmdb.Info | N
 
 # ---------- экраны ----------
 def menu_view(st, uid: int) -> tuple[str, InlineKeyboardMarkup]:
-    lines, rows = ["📋 <b>Списки</b>"], []
+    lines, items = ["📋 <b>Списки</b>"], []
 
     def entry(lst, title: str) -> None:
         todo, total = st.db.list_counts(lst["id"])
-        lines.append(f"• {esc(title)} — {todo}" + (f" (всего {total})" if total != todo else ""))
-        rows.append([B(text=f"{'📋' if not lst['group_id'] else '👥'} {title[:40]} ({todo})",
-                       callback_data=f"Lv:{lst['id']}:0:0")])
+        n = len(items) + 1
+        lines.append(f"<b>{n}.</b> {esc(title)} — {todo}" + (f" (всего {total})" if total != todo else ""))
+        items.append((n, f"{'📋' if not lst['group_id'] else '👥'} {title[:40]} ({todo})", f"Lv:{lst['id']}:0:0"))
 
     lines.append("\n<b>Мои</b>")
     for lst in st.db.lists_of_user(uid):
@@ -194,9 +194,12 @@ def menu_view(st, uid: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("\n<b>Открыли мне</b>")
         for lst in shared:
             entry(lst, list_title(st, lst, uid))
+    rows, numbers = picks.numbered(items, 5)                # v8.1: много списков — номер текстом
     rows.append([B(text="➕ Новая подборка", callback_data="Ln:0"), B(text="👥 Группы", callback_data="Gm")])
+    on = st.db.flag(uid, "lwatch")                         # v8.2: следить за раздачами фильмов из списков
+    rows.append([B(text=f"🔔 Сообщать о раздачах: {'вкл' if on else 'выкл'}", callback_data="Lp")])
     lines.append("\nДобавлять фильмы — кнопкой «➕ В список» под карточкой фильма.")
-    return "\n".join(lines), kb(rows)
+    return picks.finish("\n".join(lines), numbers, "открыть список"), kb(rows)
 
 
 def list_view(st, lid: int, uid: int, page: int = 0, show_watched: bool = False) -> tuple[str, InlineKeyboardMarkup]:
@@ -243,8 +246,8 @@ def list_view(st, lid: int, uid: int, page: int = 0, show_watched: bool = False)
         done = "✅ " if it["watched_at"] and r != "viewer" else ""
         lines.append(f"<b>{i + 1}.</b> {done}{icon(it['kind'])} {esc(label(it))}" + (f" — {esc(' · '.join(bits))}"
                                                                                     if bits else ""))
-        btns.append(B(text=str(i + 1), callback_data=f"Li:{lid}:{it['kind']}:{it['tmdb_id']}:{page}:{w}"))
-    rows = [btns[j:j + 5] for j in range(0, len(btns), 5)]
+        btns.append((i + 1, str(i + 1), f"Li:{lid}:{it['kind']}:{it['tmdb_id']}:{page}:{w}"))
+    rows, numbers = picks.numbered(btns, 5, per_row=5)      # v8.1: много — номер текстом
     nav = []
     if page > 0:
         nav.append(B(text="◀", callback_data=f"Lv:{lid}:{page - 1}:{w}"))
@@ -268,9 +271,9 @@ def list_view(st, lid: int, uid: int, page: int = 0, show_watched: bool = False)
         tools.append(B(text="🗑 Удалить", callback_data=f"Lx:{lid}"))
     rows.append(tools)
     rows.append([B(text="◀ Все списки", callback_data="Lm")])
-    if len(lines) > 1:
+    if len(lines) > 1 and not numbers:
         lines.append("\nНажми номер — карточка фильма.")
-    return "\n".join(lines), kb(rows)
+    return picks.finish("\n".join(lines), numbers, "карточка фильма"), kb(rows)
 
 
 def item_view(st, lid: int, kind: str, tid: int, uid: int, page: int, w: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -330,14 +333,18 @@ def targets(st, uid: int) -> list:
 
 def add_view(st, kind: str, tid: int, uid: int, title: str) -> tuple[str, InlineKeyboardMarkup]:
     have = st.db.lists_with(kind, tid)
-    rows = []
-    for lst in targets(st, uid):
+    items, lines = [], []
+    for n, lst in enumerate(targets(st, uid), 1):
         mark = "✅ " if lst["id"] in have else ""
-        rows.append([B(text=f"{mark}{list_title(st, lst, uid)[:45]}", callback_data=f"Lt:{lst['id']}:{kind}:{tid}")])
+        items.append((n, f"{mark}{list_title(st, lst, uid)[:45]}", f"Lt:{lst['id']}:{kind}:{tid}"))
+        lines.append(f"<b>{n}.</b> {mark}{esc(list_title(st, lst, uid))}")
+    rows, numbers = picks.numbered(items, 5)               # v8.1: много списков — номер текстом
     rows.append([B(text="➕ Новая подборка с этим фильмом", callback_data=f"Ln:0:{kind}:{tid}")])
     rows.append([B(text="Готово", callback_data="Lk")])
-    return (f"➕ Куда добавить {icon(kind)} <b>{esc(title)}</b>?\n✅ — уже там (нажми ещё раз, чтобы убрать).",
-            kb(rows))
+    text = f"➕ Куда добавить {icon(kind)} <b>{esc(title)}</b>?\n✅ — уже там (ещё раз — убрать)."
+    if numbers:
+        text += "\n\n" + "\n".join(lines)
+    return picks.finish(text, numbers, "добавить / убрать"), kb(rows)
 
 
 def score_rows(tail: str, current: int | None) -> list[list[B]]:
@@ -525,6 +532,17 @@ def build_router(st) -> Router:
         if await deny(cb):
             return
         await cb.answer()
+        await edit(cb, *menu_view(st, cb.from_user.id))
+
+    @r.callback_query(F.data == "Lp")
+    async def watch_toggle(cb: CallbackQuery):
+        """v8.2: «🔔 Сообщать о раздачах» фильмов из моих списков и списков моих групп."""
+        if await deny(cb):
+            return
+        on = not st.db.flag(cb.from_user.id, "lwatch")
+        st.db.set_flag(cb.from_user.id, "lwatch", on)
+        await cb.answer("Буду писать, когда у фильмов из твоих списков появятся раздачи (или станут лучше)"
+                        if on else "Больше не слежу за раздачами", show_alert=on)
         await edit(cb, *menu_view(st, cb.from_user.id))
 
     @r.callback_query(F.data.regexp(r"^Lv:\d+:\d+:[01]$"))
@@ -878,9 +896,13 @@ def build_router(st) -> Router:
             if not others:
                 return await cb.answer("В группе больше никого нет", show_alert=True)
             await cb.answer()
-            return await edit(cb, f"Кого убрать из «{esc(g['name'])}»?",
-                              kb([[B(text=f"✖ {name_of(st, m['user_id'])}", callback_data=f"GK:{g['id']}:{m['user_id']}")]
-                                  for m in others] + [[B(text="◀ Назад", callback_data=f"Gv:{g['id']}")]]))
+            items = [(n, f"✖ {name_of(st, m['user_id'])}", f"GK:{g['id']}:{m['user_id']}")
+                     for n, m in enumerate(others, 1)]
+            rows, numbers = picks.numbered(items, 6)
+            names = "\n".join(f"<b>{n}.</b> {esc(t[2:])}" for n, t, _ in items) if numbers else ""
+            return await edit(cb, picks.finish(f"Кого убрать из «{esc(g['name'])}»?" + (f"\n\n{names}" if names else ""),
+                                               numbers, "убрать"),
+                              kb(rows + [[B(text="◀ Назад", callback_data=f"Gv:{g['id']}")]]))
         who = int(p[2])
         st.db.group_leave(g["id"], who)
         try:
@@ -906,9 +928,12 @@ def build_router(st) -> Router:
             if not cand:
                 return await edit(cb, "Все пользователи бота уже в группе.",
                                   kb([[B(text="◀ Назад", callback_data=f"Gv:{gid}")]]))
-            return await edit(cb, f"Кого добавить в «{esc(g['name'])}»?",
-                              kb([[B(text=f"➕ {name_of(st, u['id'])}", callback_data=f"GA:{gid}:{u['id']}")]
-                                  for u in cand[:30]] + [[B(text="◀ Назад", callback_data=f"Gv:{gid}")]]))
+            items = [(n, f"➕ {name_of(st, u['id'])}", f"GA:{gid}:{u['id']}") for n, u in enumerate(cand[:50], 1)]
+            rows, numbers = picks.numbered(items, 6)
+            names = "\n".join(f"<b>{n}.</b> {esc(t[2:])}" for n, t, _ in items) if numbers else ""
+            return await edit(cb, picks.finish(f"Кого добавить в «{esc(g['name'])}»?" + (f"\n\n{names}" if names else ""),
+                                               numbers, "добавить"),
+                              kb(rows + [[B(text="◀ Назад", callback_data=f"Gv:{gid}")]]))
         who = int(p[2])
         if st.db.group_join(gid, who):
             try:

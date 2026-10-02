@@ -261,8 +261,12 @@ async def test_light_mode_card_instead_of_releases(env):
     await send(CAROL, "назад в будущее")
     kind, text, kb = last(session, CAROL)
     labels = [b.text for b in buttons(kb)]
-    assert not calls and "➕ В список" in labels and "⭐ Оценить" in labels
+    assert "➕ В список" in labels and "⭐ Оценить" in labels
     assert not any("раздачи" in x for x in labels)
+    # v8.2: раздачи ищутся только ради кнопки «📋 Magnet», добавленной к карточке
+    edits = [m for m in session.calls if type(m).__name__ == "EditMessageReplyMarkup"]
+    copy = [b for b in buttons(edits[-1].reply_markup) if b.copy_text]
+    assert calls and copy and copy[0].copy_text.text.startswith("magnet:?xt=urn:btih:" + "1" * 40)
     await press(CAROL, f"dl:{'0' * 8}:0")                              # старая кнопка раздачи — не сработает
     await send(CAROL, "/status")
     assert "не разрешено" in last(session, CAROL)[1]
@@ -474,3 +478,56 @@ async def test_approve_with_download_and_input_reset(env):
     await press(ALICE, "Ln:0")
     await send(ALICE, "/lists")
     assert ALICE not in st.awaiting
+
+
+# ---------- v8.1: выбор номером вместо длинных клавиатур ----------
+async def test_pick_by_number_in_variants_and_lists(env):
+    st, session, send, press, mp = env
+    films = [mv(100 + i, f"Маска {i}", f"{1990 + i}-01-01") for i in range(5)]
+
+    async def fake_find(st_, q):
+        return films
+    mp.setattr(main, "find_info", fake_find)
+    mp.setattr(main, "add_cast", no_cast)
+    searched = []
+
+    async def fake_jac(http, cfg, q):
+        searched.append(q)
+        return [rel(f"Маска {i} ({1990 + i}) BDRip 1080p", str(i) * 40) for i in range(1, 6)]
+    mp.setattr(jacred, "search", fake_jac)
+
+    async def fake_extras(http, key, info_, lang="ru-RU"):
+        return {}
+    mp.setattr(tmdb, "extras", fake_extras)
+    await send(ALICE, "маска")
+    _, text, kb = last(session, ALICE)
+    assert "✍ Пришли номер (1–5)" in text and not any(b.callback_data.startswith("pk:") for b in buttons(kb))
+    await send(ALICE, "1917")                                          # не номер из списка — обычный поиск
+    assert "1917" not in searched
+    await send(ALICE, "маска")
+    await send(ALICE, "2")                                             # = кнопка «2. Маска 1 (1991)»
+    assert searched and any("1991" in q or "Маска 1" in q for q in searched)
+    assert "Маска 1 (1991) BDRip" in last(session, ALICE)[1]
+
+    # список из 7 фильмов: «7» открывает карточку в том же сообщении (правка, не новое)
+    lid = st.db.main_list(ALICE)
+    for i in range(7):
+        lists.remember_info(st, info(200 + i, f"Фильм {i}", "2000-01-01"))
+        st.db.list_add(lid, "m", 200 + i, ALICE, ts=1000 + i)
+    await press(ALICE, f"Lv:{lid}:0:0")
+    kind, text, kb = last(session, ALICE)
+    assert "✍ Пришли номер (1–7) — карточка фильма" in text and not any(b.text == "7" for b in buttons(kb))
+    await send(ALICE, "7")
+    m = session.calls[-1]
+    assert type(m).__name__ == "EditMessageText" and "Фильм 0" in m.text and "Список: Хочу посмотреть" in m.text
+
+    # ответ на «нажатие номером» в Telegram не уходит; предупреждение — обычным сообщением
+    from aiogram.methods import AnswerCallbackQuery
+    from bot import picks
+    b = session_bot(env)
+    picks.install(b)
+    n = len(session.calls)
+    assert await b(AnswerCallbackQuery(callback_query_id=f"{picks.FAKE}{BOB}:1", text="Нельзя", show_alert=True))
+    assert [type(m).__name__ for m in session.calls[n:]] == ["SendMessage"] and session.calls[-1].text == "Нельзя"
+    await b(AnswerCallbackQuery(callback_query_id=f"{picks.FAKE}{BOB}:2", text="ок"))
+    assert len(session.calls) == n + 1

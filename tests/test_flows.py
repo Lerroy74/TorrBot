@@ -104,10 +104,13 @@ def env(tmp_path, monkeypatch):
         st.db.set_flag(_u, "can_dl", True)
     session = FakeSession()
     bot = Bot("123:abc", session=session)
+    from bot import picks
+    picks.install(bot)                     # v8.1: выбор номером
     dp = Dispatcher()
     dp.include_router(extras.build_router(st))
     dp.include_router(main.build_router(st))
     upd = itertools.count(1)
+    st._dp, st._bot, st._upd = dp, bot, upd          # v8.2: для инлайн-запросов и голосовых в тестах
 
     async def send(uid, text):
         u = User(id=uid, is_bot=False, first_name=f"u{uid}")

@@ -65,6 +65,20 @@ CREATE TABLE IF NOT EXISTS list_shares (      -- кому открыт личн�
     at         INTEGER,
     PRIMARY KEY (list_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS list_watch (         -- v8.2: что уже сообщали о раздачах фильма из списков
+    user_id    INTEGER,
+    kind       TEXT,
+    tmdb_id    INTEGER,
+    level      INTEGER,                       -- 0 — раздач нет, 1 — есть, 2 — есть хорошего качества
+    at         INTEGER,
+    PRIMARY KEY (user_id, kind, tmdb_id)
+);
+CREATE TABLE IF NOT EXISTS list_watch_film (    -- v8.2: когда проверяли фильм
+    kind       TEXT,
+    tmdb_id    INTEGER,
+    checked_at INTEGER,
+    PRIMARY KEY (kind, tmdb_id)
+);
 CREATE TABLE IF NOT EXISTS ai_usage (         -- расход ИИ по дням
     day        TEXT,
     user_id    INTEGER,
@@ -437,9 +451,10 @@ class ListsDB:
 
     def ai_requests(self, day: str, uid: int | None = None) -> int:
         if uid is None:
-            row = self.c.execute("SELECT SUM(req) FROM ai_usage WHERE day=?", (day,)).fetchone()
+            row = self.c.execute("SELECT SUM(req) FROM ai_usage WHERE day=? AND provider!='stt'", (day,)).fetchone()
         else:
-            row = self.c.execute("SELECT SUM(req) FROM ai_usage WHERE day=? AND user_id=?", (day, uid)).fetchone()
+            row = self.c.execute("SELECT SUM(req) FROM ai_usage WHERE day=? AND user_id=? AND provider!='stt'",
+                                 (day, uid)).fetchone()
         return int(row[0] or 0)
 
     def ai_usage(self, prefix: str) -> list[sqlite3.Row]:

@@ -18,7 +18,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import ai, aictl, tmdb
+from . import ai, aictl, picks, tmdb
 from .lists import is_kid, kid_ok_row, label, name_of, remember_info, seen_marks
 
 log = logging.getLogger("torrbot")
@@ -76,15 +76,16 @@ def render(st, head: str, items: list[tuple[tmdb.Info, str]], extra_rows=None) -
     """Список вариантов: кнопка — как в обычном поиске (раздачи или карточка, если качать нельзя)."""
     infos = [i for i, _ in items]
     cid = st.put_choice(head[:60], infos, [])
-    lines, rows = [head], []
+    lines, btns = [head], []
     for n, (info, note) in enumerate(items):
         rating = f" · ⭐ {info.rating:.1f}" if info.rating else ""
         lines.append(f"<b>{n + 1}.</b> {'📺' if info.is_tv else '🎬'} {esc(tmdb.short_label(info, 80))}{rating}"
                      + (f"\n   {esc(note)}" if note else ""))
-        rows.append([B(text=f"{n + 1}. {tmdb.short_label(info)}", callback_data=f"pk:{cid}:{n}")])
+        btns.append((n + 1, f"{n + 1}. {tmdb.short_label(info)}", f"pk:{cid}:{n}"))
         remember_info(st, info)
+    rows, numbers = picks.numbered(btns, 3)                # v8.1: много — номер текстом
     rows += extra_rows or []
-    text = "\n\n".join(lines)
+    text = picks.finish("\n\n".join(lines), numbers)
     st.remember(cid, text, kb(rows))
     return text, kb(rows)
 
