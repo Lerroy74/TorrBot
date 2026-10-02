@@ -4,6 +4,9 @@
 #    6 раз подряд (≈12 мин) — перезагрузка (не чаще раза в час);
 #  * Kodi: процесса нет 2 раза подряд — запуск; веб-управление не отвечает 3 раза подряд
 #    (Kodi завис) — перезапуск Kodi;
+#  * скрейперы TMDB: дописывает тайм-аут 30 с к их запросам (иначе подвисший ответ TMDB вешает
+#    обновление медиатеки навсегда). Kodi обновил скрейпер — сторож допишет снова;
+#  * обновление медиатеки идёт дольше SCAN_MAX_MIN (45) минут — зависло, перезапуск Kodi;
 #  * если в /storage/.config/torrbot-pi.env задан BOT_TOKEN — пишет админам в Telegram,
 #    что починил (через прокси сервера).
 # Ручной запуск:  sh /storage/.config/torrbot-pi-watch.sh --status | --test
@@ -71,4 +74,29 @@ if pidof kodi.bin >/dev/null 2>&1 || pidof kodi.bin-gbm >/dev/null 2>&1 || pidof
 else
   n=$(count kodi_proc); log "Kodi не запущен ($n)"
   if [ "$n" -ge 2 ]; then log "запускаю Kodi"; reset kodi_proc; systemctl start kodi; send "Kodi был выключен — запустил."; fi
+fi
+
+# 3. скрейперы TMDB: тайм-аут на запросы (Kodi при обновлении дополнения его сотрёт — вернём)
+for f in /storage/.kodi/addons/metadata.tvshows.themoviedb.org.python/libs/api_utils.py \
+         /storage/.kodi/addons/metadata.themoviedb.org.python/python/lib/tmdbscraper/api_utils.py; do
+  if [ -f "$f" ] && grep -q "urlopen(req)" "$f"; then
+    sed -i 's/urlopen(req)/urlopen(req, timeout=30)/g' "$f" && log "скрейпер: добавил тайм-аут ($(basename "$(dirname "$f")"))"
+  fi
+done
+
+# 4. зависшее обновление медиатеки
+pidof kodi.bin >/dev/null 2>&1 || pidof kodi.bin-gbm >/dev/null 2>&1 || pidof kodi-gbm >/dev/null 2>&1 || exit 0
+WP=${KODI_WEB_PASS:-$(sed -n 's|.*id="services.webserverpassword"[^>]*>\([^<]*\)<.*|\1|p' /storage/.kodi/userdata/guisettings.xml 2>/dev/null)}
+scanning=$(curl -s -m 15 -H 'Content-Type: application/json' ${WP:+-u "kodi:$WP"} \
+  -d '{"jsonrpc":"2.0","id":1,"method":"XBMC.GetInfoBooleans","params":{"booleans":["Library.IsScanningVideo"]}}' \
+  http://127.0.0.1:8080/jsonrpc | grep -c '"Library.IsScanningVideo":true')
+if [ "$scanning" = 1 ]; then
+  since=$(cat "$STATE/scan_since" 2>/dev/null || { echo "$NOW" > "$STATE/scan_since"; echo "$NOW"; })
+  if [ $((NOW - since)) -ge $(( ${SCAN_MAX_MIN:-45} * 60 )) ]; then
+    log "обновление медиатеки идёт $(( (NOW - since) / 60 )) мин — зависло, перезапуск Kodi"
+    reset scan_since; systemctl restart kodi
+    send "обновление медиатеки зависло — перезапустил Kodi."
+  fi
+else
+  reset scan_since
 fi
