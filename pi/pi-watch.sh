@@ -4,8 +4,8 @@
 #    6 раз подряд (≈12 мин) — перезагрузка (не чаще раза в час);
 #  * Kodi: процесса нет 2 раза подряд — запуск; веб-управление не отвечает 3 раза подряд
 #    (Kodi завис) — перезапуск Kodi;
-#  * скрейперы TMDB: дописывает тайм-аут 30 с к их запросам (иначе подвисший ответ TMDB вешает
-#    обновление медиатеки навсегда). Kodi обновил скрейпер — сторож допишет снова;
+#  * скрейперы TMDB: пускает их запросы через прокси Kodi, с тайм-аутом (провайдер рвёт соединения
+#    с TMDB — без этого обновление медиатеки висит вечно). Kodi обновил скрейпер — сторож поправит снова;
 #  * обновление медиатеки идёт дольше SCAN_MAX_MIN (45) минут — зависло, перезапуск Kodi;
 #  * если в /storage/.config/torrbot-pi.env задан BOT_TOKEN — пишет админам в Telegram,
 #    что починил (через прокси сервера).
@@ -76,13 +76,10 @@ else
   if [ "$n" -ge 2 ]; then log "запускаю Kodi"; reset kodi_proc; systemctl start kodi; send "Kodi был выключен — запустил."; fi
 fi
 
-# 3. скрейперы TMDB: тайм-аут на запросы (Kodi при обновлении дополнения его сотрёт — вернём)
-for f in /storage/.kodi/addons/metadata.tvshows.themoviedb.org.python/libs/api_utils.py \
-         /storage/.kodi/addons/metadata.themoviedb.org.python/python/lib/tmdbscraper/api_utils.py; do
-  if [ -f "$f" ] && grep -q "urlopen(req)" "$f"; then
-    sed -i 's/urlopen(req)/urlopen(req, timeout=30)/g' "$f" && log "скрейпер: добавил тайм-аут ($(basename "$(dirname "$f")"))"
-  fi
-done
+# 3. скрейперы TMDB: запросы через прокси Kodi + тайм-аут (Kodi обновил дополнение — поправим снова)
+if [ -f /storage/.config/torrbot-scraper-fix.py ]; then
+  python3 /storage/.config/torrbot-scraper-fix.py | while read -r l; do log "скрейпер: $l"; done
+fi
 
 # 4. зависшее обновление медиатеки
 pidof kodi.bin >/dev/null 2>&1 || pidof kodi.bin-gbm >/dev/null 2>&1 || pidof kodi-gbm >/dev/null 2>&1 || exit 0

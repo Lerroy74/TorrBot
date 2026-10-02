@@ -5,6 +5,7 @@ set -e
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG=/storage/.config
 cp "$DIR/pi-watch.sh" $CFG/torrbot-pi-watch.sh && chmod 755 $CFG/torrbot-pi-watch.sh
+cp "$DIR/scraper-fix.py" $CFG/torrbot-scraper-fix.py
 if [ -f "$DIR/secrets.env" ]; then
   cp "$DIR/secrets.env" $CFG/torrbot-pi.env && chmod 600 $CFG/torrbot-pi.env
   echo "Секреты: $CFG/torrbot-pi.env"
