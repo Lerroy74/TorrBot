@@ -7,7 +7,7 @@ from aiohttp import web
 os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ.setdefault("ADMIN_IDS", "1")
 
-from bot import cleanup, kodi, main, tmdb  # noqa: E402
+from bot import cleanup, kodi, main, remote, tmdb  # noqa: E402
 from bot.config import load  # noqa: E402
 from bot.db import DB  # noqa: E402
 
@@ -148,7 +148,8 @@ async def test_cleanup_cycle(tmp_path, monkeypatch):
     db.set_warned("a", int(time.time()) - 25 * 3600)
     await main.cleanup_once(bot, st)              # прошло 25 ч — удаляем
     assert tr.removed == [("a", True)] and db.get("a")["removed"] == 1
-    assert "Удалил" in bot.msgs[-1][0] and kd.cleaned == 1
+    assert "Удалил" in bot.msgs[-1][0] and "clean" in st.kodi_jobs     # чистка медиатеки — через очередь Kodi
+    assert await remote.kodi_sync_once(st, time.time() + 60) == ["clean"] and kd.cleaned == 1
 
     report = await main.cleanup_report(st)
     assert "Fresh.mkv" in report and "удалю после" in report

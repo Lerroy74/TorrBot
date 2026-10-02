@@ -141,7 +141,7 @@ async def test_long_unknown_query_goes_to_plot(env):
     mp.setattr(wiki, "search_by_plot", fake_plot)
     await send(ALICE, "мужик находит маску и становится зелёным")
     _, text, kb = session.sent(ALICE)[-1]
-    assert seen and "По описанию похоже" in text
+    assert seen and "По описанию (Википедия) похоже" in text
     assert buttons(kb)[0].text.startswith("1. 🎬 Маска (1994)")
 
 

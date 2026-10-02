@@ -133,12 +133,18 @@ async def files_view(st, h: str):
 
 
 # ================= 5–6, 12. Кнопки под обложкой: трейлер, все части, «хотим» =================
-async def info_kb(st, info: tmdb.Info | None) -> InlineKeyboardMarkup | None:
+async def info_kb(st, info: tmdb.Info | None, uid: int | None = None) -> InlineKeyboardMarkup | None:
+    """Кнопки под обложкой: трейлер, «➕ В список», «⭐ Оценить», все части, подписка на сериал."""
     if not info or not st.cfg.tmdb_key:
         return None
     kind = "t" if info.is_tv else "m"
     st.infos[(kind, info.tmdb_id)] = info
-    row1 = [B(text="⭐ Хотим посмотреть", callback_data=f"wl:{kind}:{info.tmdb_id}")]
+    try:
+        st.db.title_put(kind, info.tmdb_id, info.title, info.year, info.poster, info.genres)
+    except Exception as e:
+        log.info("titles: %r", e)
+    row1 = [B(text="➕ В список", callback_data=f"La:{kind}:{info.tmdb_id}"),
+            B(text="⭐ Оценить", callback_data=f"Lr:0:{kind}:{info.tmdb_id}:0:0")]
     rows = [row1]
     try:
         ex = await tmdb.extras(st.tmdb_http, st.cfg.tmdb_key, info, st.cfg.tmdb_lang)
@@ -150,6 +156,9 @@ async def info_kb(st, info: tmdb.Info | None) -> InlineKeyboardMarkup | None:
     if ex.get("collection"):
         cid, name = ex["collection"]
         rows.append([B(text=f"📚 Все части: {name[:35]}", callback_data=f"col:{cid}")])
+    can_dl = uid is None or st.hooks.get("may_download", lambda _: True)(uid)
+    if info.is_tv and can_dl:
+        rows.append([B(text="🔔 Следить за новыми сериями", callback_data=f"sbt:{info.tmdb_id}")])
     return kb(rows)
 
 
@@ -275,7 +284,8 @@ async def weekly_report(st) -> str:
     lines = ["📊 <b>Неделя в torrbot</b>",
              f"Поставлено: {len(added)}" + (f" ({', '.join(f'{k} — {v}' for k, v in by_user.items())})" if by_user else ""),
              f"Докачалось: {len(done)}"]
-    reasons = {"cleanup": "автоочистка", "cancel": "отменено", "manual": "вручную"}
+    reasons = {"cleanup": "автоочистка", "cancel": "отменено", "manual": "вручную",
+               "replaced": "заменено новой раздачей"}
     removed = [r for r in removed if r["removed_reason"] != "delete"]     # эти — ниже, из /delete
     if removed:
         cnt: dict[str, int] = {}
@@ -303,9 +313,12 @@ async def weekly_report(st) -> str:
                      + (f", свободно {gb(free)}" if free is not None else ""))
     except Exception:
         lines.append("\n💾 Transmission не ответил")
-    wl = st.db.wishlist()[:3]
+    wl = st.db.c.execute(
+        "SELECT t.title, COUNT(*) AS n FROM list_votes v JOIN list_items i ON i.list_id=v.list_id AND i.kind=v.kind"
+        " AND i.tmdb_id=v.tmdb_id AND i.watched_at IS NULL LEFT JOIN titles t ON t.kind=v.kind AND t.tmdb_id=v.tmdb_id"
+        " GROUP BY v.list_id, v.kind, v.tmdb_id ORDER BY n DESC LIMIT 3").fetchall()
     if wl:
-        lines.append("⭐ Больше всего хотят: " + ", ".join(f"{esc(w['title'])} (👍 {w['n']})" for w in wl))
+        lines.append("⭐ Больше всего хотят (в группах): " + ", ".join(f"{esc(w['title'] or '?')} (👍 {w['n']})" for w in wl))
     bad = ", ".join(NAMES[k] for k in st.health.bad) if st.health.bad else ""
     lines.append(f"🩺 Сейчас не в порядке: {bad}" if bad else "🩺 Всё работает")
     return "\n".join(lines)
@@ -467,9 +480,14 @@ def kodi_poster(art: dict | None) -> str | None:
     return url.replace("/t/p/original/", "/t/p/w500/")
 
 
-async def random_pick(st) -> tuple[str, InlineKeyboardMarkup | None, str | None]:
-    """(текст, клавиатура, обложка). Сначала — непросмотренное из медиатеки Kodi, иначе — из TMDB."""
-    if st.kodi:
+async def random_pick(st, uid: int = 0) -> tuple[str, InlineKeyboardMarkup | None, str | None]:
+    """(текст, клавиатура, обложка). Сначала — непросмотренное из медиатеки Kodi, иначе — из TMDB.
+    В детском режиме — только мультфильмы и семейное из TMDB."""
+    from .kids import is_kid
+    kid = is_kid(st, uid)
+    can_dl = st.hooks.get("may_download", lambda _: True)(uid) if uid else True
+    more = st.hooks["random_rows"](uid) if uid and "random_rows" in st.hooks else []
+    if st.kodi and not kid and can_dl:
         try:
             res = await st.kodi.call("VideoLibrary.GetMovies", {
                 "properties": ["title", "year", "plot", "rating", "art", "uniqueid"],
@@ -489,19 +507,21 @@ async def random_pick(st) -> tuple[str, InlineKeyboardMarkup | None, str | None]
                 return (f"🎲 Уже на диске, ещё не смотрели:\n\n🎬 <b>{esc(m.get('title') or '')}</b>"
                         f" ({m.get('year') or '—'})" + (f" · ⭐ {m['rating']:.1f}" if m.get("rating") else "")
                         + (f"\n\n{esc(plot)}" if plot else "") + f"\n\nНепросмотренных на диске: {len(movies)}",
-                        kb([[B(text="🎲 Ещё", callback_data="rnd")]]), poster)
+                        kb([[B(text="🎲 Ещё", callback_data="rnd")]] + more), poster)
         except Exception as e:
             log.info("random: Kodi: %r", e)
     if not st.cfg.tmdb_key:
         return "На диске нет непросмотренного, а TMDB не настроен.", None, None
-    params = tmdb.discover_params("m", "", "", "", "top", random.randint(1, 20))
+    params = tmdb.discover_params("m", "10751" if kid else "", "", "", "top", random.randint(1, 20))
     infos, _ = await tmdb.discover(st.tmdb_http, st.cfg.tmdb_key, "m", params, st.cfg.tmdb_lang)
     if not infos:
         return "Не получилось ничего подобрать, попробуй ещё раз.", kb([[B(text="🎲 Ещё", callback_data="rnd")]]), None
     info = random.choice(infos)
     cid = st.put_choice(info.title, [info], [])
-    return (f"🎲 На диске непросмотренного нет. Как насчёт:\n\n{info.caption(400)}",
-            kb([[B(text="⬇ Найти раздачи", callback_data=f"pk:{cid}:0"), B(text="🎲 Ещё", callback_data="rnd")]]),
+    head = "🎲 На диске непросмотренного нет. Как насчёт:" if (st.kodi and can_dl and not kid) else "🎲 Как насчёт:"
+    return (f"{head}\n\n{info.caption(400)}",
+            kb([[B(text="⬇ Найти раздачи" if can_dl else "🎞 Подробнее", callback_data=f"pk:{cid}:0"),
+                 B(text="🎲 Ещё", callback_data="rnd")]] + more),
             info.poster)
 
 
@@ -607,6 +627,8 @@ def build_router(st) -> Router:
             await cb.message.answer("TMDB сейчас не отвечает, попробуй позже.")
             return
         from .main import render_choice
+        from .kids import only_kids
+        parts = only_kids(st, cb.from_user.id, parts)
         cid = st.put_choice(name, parts, [])
         text, k = render_choice(f"📚 <b>{esc(name)}</b> — {len(parts)} фильм(ов). Выбери один или скачай все:",
                                 parts, [], cid, None,
@@ -622,6 +644,9 @@ def build_router(st) -> Router:
         if not ch:
             await cb.answer("Список устарел, открой заново", show_alert=True)
             return
+        if not st.hooks.get("may_download", lambda _: True)(cb.from_user.id):
+            from .access import NO_DL
+            return await cb.answer(NO_DL, show_alert=True)
         await cb.answer("Ищу раздачи…")
         try:
             await cb.message.edit_reply_markup(reply_markup=None)
@@ -646,14 +671,7 @@ def build_router(st) -> Router:
             text += "\nНе нашёл подходящих раздач: " + esc(", ".join(miss))
         await cb.message.answer(text)
 
-    # --- «Хотим посмотреть» ---
-    @r.message(Command("want"))
-    async def want(msg: Message):
-        if not allowed(msg.from_user.id):
-            return
-        t, k = wish_view(st)
-        await msg.answer(t, reply_markup=k)
-
+    # --- «Хотим посмотреть» (до v8; теперь — списки, /lists) ---
     async def info_of(kind: str, tid: int) -> tmdb.Info | None:
         if (kind, tid) in st.infos:
             return st.infos[(kind, tid)]
@@ -671,6 +689,16 @@ def build_router(st) -> Router:
             return
         act, kind, tid = cb.data.split(":")
         tid, uid = int(tid), cb.from_user.id
+        if "open_add" in st.hooks:                      # v8: старые кнопки → списки
+            if act in ("wl", "wv"):
+                return await st.hooks["open_add"](cb, kind, tid)
+            if act == "wd":
+                info = await info_of(kind, tid)
+                await cb.answer()
+                if info:
+                    await st.hooks["search_for"](cb.message, info, uid=uid)
+                return
+            return await cb.answer("«Хотим посмотреть» переехал в списки — /lists", show_alert=True)
         if act == "wl":
             info = await info_of(kind, tid)
             if not info:
@@ -740,6 +768,13 @@ def build_router(st) -> Router:
             return
         res = await check_all(st)
         lines = ["🩺 <b>Состояние</b>"] + [f"{'✅' if ok else '⚠'} {NAMES[k]}: {esc(d)}" for k, (ok, d) in res.items()]
+        if "load_summary" in st.hooks:
+            lines += st.hooks["load_summary"]()
+        if getattr(st, "ai", None) is not None:
+            lines.append(f"🤖 ИИ для /plot: {esc(st.ai.status())}")
+        if st.kodi_jobs:
+            lines.append("⏳ Kodi: жду малинку, чтобы " + ", ".join(
+                {"scan": "обновить медиатеку", "clean": "почистить медиатеку"}.get(j, j) for j in st.kodi_jobs))
         await msg.answer("\n".join(lines))
 
     @r.message(Command("report"))
@@ -777,7 +812,7 @@ def build_router(st) -> Router:
     async def rnd(msg: Message):
         if not allowed(msg.from_user.id):
             return
-        t, k, poster = await random_pick(st)
+        t, k, poster = await random_pick(st, msg.from_user.id)
         await st.hooks["send_with_poster"](msg.bot, st, msg.chat.id, t, poster, reply_markup=k)
 
     @r.callback_query(F.data == "rnd")
@@ -785,7 +820,7 @@ def build_router(st) -> Router:
         if await deny(cb):
             return
         await cb.answer()
-        t, k, poster = await random_pick(st)
+        t, k, poster = await random_pick(st, cb.from_user.id)
         await st.hooks["send_with_poster"](cb.bot, st, cb.message.chat.id, t, poster, reply_markup=k)
 
     return r

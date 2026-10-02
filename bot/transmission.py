@@ -47,7 +47,8 @@ class Transmission:
     async def get(self, hashes: list[str] | None = None) -> list[dict]:
         fields = ["hashString", "name", "percentDone", "status", "error", "errorString",
                   "totalSize", "eta", "rateDownload", "peersSendingToUs", "metadataPercentComplete",
-                  "downloadDir", "queuePosition", "doneDate", "addedDate", "bandwidthPriority"]
+                  "downloadDir", "queuePosition", "doneDate", "addedDate", "bandwidthPriority",
+                  "leftUntilDone", "sizeWhenDone", "haveValid", "rateUpload"]
         kw = {"fields": fields}
         if hashes is not None:
             if not hashes:
@@ -88,6 +89,22 @@ class Transmission:
         await self.call("torrent-set", **args)
 
     async def session_set(self, **kw) -> None:
+        await self.call("session-set", **kw)
+
+    async def session_get(self, fields: list[str] | None = None) -> dict:
+        return await self.call("session-get", **({"fields": fields} if fields else {}))
+
+    async def stats(self) -> dict:
+        """Общая скорость: downloadSpeed / uploadSpeed (байт/с), activeTorrentCount…"""
+        return await self.call("session-stats")
+
+    async def turtle(self, on: bool, down_kb: int | None = None, up_kb: int | None = None) -> None:
+        """«Черепаха» (альтернативная скорость Transmission): включить/выключить и задать лимиты, кБ/с."""
+        kw: dict = {"alt-speed-enabled": bool(on), "alt-speed-time-enabled": False}
+        if down_kb is not None:
+            kw["alt-speed-down"] = int(down_kb)
+        if up_kb is not None:
+            kw["alt-speed-up"] = int(up_kb)
         await self.call("session-set", **kw)
 
     async def remove(self, h: str, delete_data: bool = True) -> None:

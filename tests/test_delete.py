@@ -64,6 +64,8 @@ def lib(tmp_path, monkeypatch):
     st = main.State(cfg, DB(str(tmp_path / "db.sqlite3")), tr, None)
     st.db.allow(ALICE, "Алиса (@alice)")
     st.db.allow(BOB, "Боб")
+    for _u in (ALICE, BOB):        # были в боте до v8 — могут качать
+        st.db.set_flag(_u, "can_dl", True)
     session = FakeSession()
     bot = Bot("123:abc", session=session)
     dp = Dispatcher()
@@ -156,7 +158,11 @@ async def test_rights_default_admin_only_and_toggle(lib):
     assert not st.db.can_delete(ALICE)
 
     await send(ADMIN, "/users")
-    assert "удалять: нельзя" in " ".join(b.text for b in buttons(last(session, ADMIN)[2]))
+    assert any(b.callback_data == f"uc:{ALICE}" for b in buttons(last(session, ADMIN)[2]))
+    card, _ = await main.user_card(st, ALICE)
+    assert "удаляет" not in card
+    _, kb = await main.user_card(st, ALICE)
+    assert "Удалять: нельзя" in " ".join(b.text for b in buttons(kb))
     await press(ADMIN, f"udl:{ALICE}")
     assert st.db.can_delete(ALICE)
     assert "/delete" in last(session, ALICE)[1]                   # ей пришла подсказка

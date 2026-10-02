@@ -18,7 +18,11 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
-from . import __version__, cleanup, deleter, extras, jacred, journal, kodi, tmdb, wiki
+from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, recs,
+               remote, space, stall, subs, tmdb, wiki)
+from .access import DL, NO_DL, may_download
+from .access import AI as AI_FLAG
+from . import guard as loadguard
 from .config import Config, load
 from .db import DB
 from .transmission import Transmission, TransmissionError
@@ -45,6 +49,19 @@ class State:
         self.back: dict[str, str] = {}           # sid раздач → cid вариантов, откуда пришли
         self.casts: dict[tuple[bool, int], tuple[float, list[str]]] = {}   # актёры по (сериал?, id)
         self.health = extras.Health()
+        # v7
+        self.ai: ai.Chain | None = None            # цепочка ИИ для поиска по описанию (Алиса, Groq, Gemini)
+        self.kodi_jobs: dict[str, float] = {}     # scan/clean → когда попробовать (повтор, если малинка спит)
+        self.guard = loadguard.Guard()                # сторож нагрузки и «черепаха»
+        self.pending_adds: dict[str, dict] = {}   # закачки, которые не влезли на диск (кнопка «поставить снова»)
+        self.progress: dict[str, tuple] = {}      # hash → (прогресс, с какого времени не меняется)
+        self.stall_alts: dict[str, tuple] = {}    # hash зависшей → (время, другие раздачи)
+        self.sub_alts: dict[int, tuple] = {}      # подписка → (время, другие раздачи)
+        self.sub_meta_done: set[str] = set()      # раздачи подписок, где уже отметили «не качать»
+        self.wait_hint: dict[str, tuple] = {}     # sid раздач → (kind, tmdb_id) для кнопки «⏳ ждать»
+        # v8
+        self.awaiting: dict[int, tuple] = {}      # uid → (время, что ждём текстом: название подборки/группы, запрос к ИИ)
+        self.bot_username: str = ""
 
     def is_allowed(self, uid: int) -> bool:
         return uid in self.cfg.admin_ids or uid in self.cfg.allowed_ids or self.db.is_allowed(uid)
@@ -211,6 +228,10 @@ def render_page(st: State, sid: str, page: int) -> tuple[str, InlineKeyboardMark
         nav.append(InlineKeyboardButton(text="▶", callback_data=f"pg:{sid}:{page + 1}"))
     if nav:
         rows.append(nav)
+    hint = st.wait_hint.get(sid)
+    if hint:
+        rows.append([InlineKeyboardButton(text=f"⏳ Ждать раздачу от {st.cfg.wait_min_height}p",
+                                          callback_data=f"wt:{hint[0]}:{hint[1]}")])
     back = st.back.get(sid)
     if back and back in st.views:
         rows.append([InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")])
@@ -304,43 +325,53 @@ def podbor_label(parts: list[str]) -> str:
     return ", ".join(b for b in bits if b)
 
 
-def cancel_kb(h: str, series: bool = False) -> InlineKeyboardMarkup:
+def cancel_kb(h: str, series: bool = False, subscribe: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="✖ Отменить закачку", callback_data=f"cx:{h}")]]
     if series:
         rows.insert(0, [InlineKeyboardButton(text="🗂 Выбрать сезоны", callback_data=f"fs:{h}")])
+    if subscribe:
+        rows.append([InlineKeyboardButton(text="🔔 Следить за новыми сериями", callback_data=f"sb:{h}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
-    """Экран /users: пользователи со статистикой, ожидающие запросы, заблокированные."""
-    sizes: dict[str, int] = {}
+def user_stats(st: State, u, sizes: dict[str, int]) -> str:
+    dl = st.db.downloads_of(u["id"])
+    on_disk = sum(sizes.get(d["hash"], 0) for d in dl if not d["removed"])
+    rights = [x for x, on in (("⬇ качает", st.db.flag(u["id"], DL)), ("🗑 удаляет", st.db.can_delete(u["id"])),
+                              ("📺 пульт", st.db.flag(u["id"], remote.REMOTE)),
+                              ("🧸 детский режим", st.db.flag(u["id"], kids.KIDS)),
+                              ("🤖 ИИ", st.db.flag(u["id"], AI_FLAG))) if on]
+    return (f"   с {datetime.fromtimestamp(u['added_at'] or 0):%d.%m.%y} · был: {fmt_day(u['last_seen'])}\n"
+            f"   закачек: {len(dl)} · на диске: {fmt_size(on_disk)}"
+            + (f"\n   {' · '.join(rights)}" if rights else ""))
+
+
+async def torrent_sizes(st: State) -> dict[str, int]:
     try:
-        sizes = {t["hashString"].lower(): int(t.get("totalSize") or 0) for t in await st.tr.get()}
+        return {t["hashString"].lower(): int(t.get("totalSize") or 0) for t in await st.tr.get()}
     except Exception as e:
         log.info("users: Transmission недоступен: %s", e)
+        return {}
+
+
+async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран /users: пользователи со статистикой (кнопка — карточка с правами), запросы, заблокированные."""
+    sizes = await torrent_sizes(st)
     rows: list[list[InlineKeyboardButton]] = []
     lines = []
     users = st.db.users()
     lines.append(f"👥 <b>Пользователи</b> ({len(users)}), админы не показаны:" if users
                  else "👥 Пользователей пока нет (кроме админов).")
+    btns = []
     for i, u in enumerate(users, 1):
-        dl = st.db.downloads_of(u["id"])
-        on_disk = sum(sizes.get(d["hash"], 0) for d in dl if not d["removed"])
         name = u["name"] or str(u["id"])
-        can_del = st.db.can_delete(u["id"])
-        lines.append(f"<b>{i}. {esc(name)}</b> · <code>{u['id']}</code>\n"
-                     f"   с {datetime.fromtimestamp(u['added_at'] or 0):%d.%m.%y} · был: {fmt_day(u['last_seen'])}\n"
-                     f"   закачек: {len(dl)} · на диске: {fmt_size(on_disk)}"
-                     + ("\n   🗑 может удалять" if can_del else ""))
-        rows.append([InlineKeyboardButton(text=f"🚫 {i}. {name[:18]} — убрать доступ", callback_data=f"urv:{u['id']}"),
-                     InlineKeyboardButton(text="⛔ блок", callback_data=f"ubl:{u['id']}")])
-        rows.append([InlineKeyboardButton(
-            text=f"🗑 {i}. удалять: {'можно ✅ (запретить)' if can_del else 'нельзя (разрешить)'}",
-            callback_data=f"udl:{u['id']}")])
+        lines.append(f"<b>{i}. {esc(name)}</b> · <code>{u['id']}</code>\n" + user_stats(st, u, sizes))
+        btns.append(InlineKeyboardButton(text=f"⚙ {i}. {name.split(' (')[0][:16]}", callback_data=f"uc:{u['id']}"))
+    rows += [btns[j:j + 2] for j in range(0, len(btns), 2)]
     reqs = st.db.requests()
     if reqs:
         lines.append("⏳ <b>Ждут подтверждения:</b>")
-        for q in reqs:
+        for q in reqs[:15]:
             name = q["name"] or str(q["id"])
             lines.append(f"• {esc(name)} · <code>{q['id']}</code> · {fmt_day(q['at'])}")
             rows.append([InlineKeyboardButton(text=f"✅ {name[:18]}", callback_data=f"uok:{q['id']}"),
@@ -352,9 +383,37 @@ async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
         for b in blocked:
             name = b["name"] or str(b["id"])
             lines.append(f"• {esc(name)} · <code>{b['id']}</code>")
-            rows.append([InlineKeyboardButton(text=f"↩ Разблокировать {name[:18]}", callback_data=f"uub:{b['id']}")])
+        rows += [[InlineKeyboardButton(text=f"↩ Разблокировать {(b['name'] or str(b['id']))[:18]}",
+                                       callback_data=f"uub:{b['id']}")] for b in blocked[:10]]
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="uref")])
-    return "\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "\n\n".join(lines) + ("\n\n⚙ — права человека: качать, удалять, пульт, детский режим, ИИ, убрать доступ."
+                                  if users else "")
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def user_card(st: State, uid: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    u = st.db.user(uid)
+    if u is None:
+        return None
+    sizes = await torrent_sizes(st)
+    can_del, can_tv, kid = st.db.can_delete(uid), st.db.flag(uid, remote.REMOTE), st.db.flag(uid, kids.KIDS)
+    can_dl, ai_on = st.db.flag(uid, DL), st.db.flag(uid, AI_FLAG)
+    B = InlineKeyboardButton
+    text = f"👤 <b>{esc(u['name'] or str(uid))}</b> · <code>{uid}</code>\n" + user_stats(st, u, sizes)
+    groups = st.db.groups_of(uid)
+    if groups:
+        text += "\n   👥 " + esc(", ".join(g["name"] for g in groups))
+    ai_who = aictl.setting(st, "who", "all")
+    rows = [[B(text=f"⬇ Качать: {'можно ✅ (запретить)' if can_dl else 'нельзя — только списки (разрешить)'}",
+               callback_data=f"udw:{uid}:c")],
+            [B(text=f"🗑 Удалять: {'можно ✅ (запретить)' if can_del else 'нельзя (разрешить)'}", callback_data=f"udl:{uid}:c")],
+            [B(text=f"📺 Пульт ТВ: {'есть ✅ (забрать)' if can_tv else 'нет (дать)'}", callback_data=f"urm:{uid}:c")],
+            [B(text=f"🧸 Детский режим: {'вкл ✅ (выключить)' if kid else 'выкл (включить)'}", callback_data=f"ukd:{uid}:c")],
+            [B(text=f"🤖 ИИ: {'отмечен ✅' if ai_on else 'не отмечен'}"
+                    + (" (сейчас ИИ доступен всем)" if ai_who == "all" else ""), callback_data=f"uai:{uid}:c")],
+            [B(text="🚫 Убрать доступ", callback_data=f"urv:{uid}"), B(text="⛔ Заблокировать", callback_data=f"ubl:{uid}")],
+            [B(text="◀ К списку", callback_data="uref")]]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_router(st: State) -> Router:
@@ -382,47 +441,75 @@ def build_router(st: State) -> Router:
         return False
 
     # ---------- доступ ----------
-    @r.message(CommandStart())
-    async def start(msg: Message, bot: Bot):
-        u = msg.from_user
-        if st.is_allowed(u.id):
-            st.db.touch(u.id)
-            await msg.answer(
-                "Напиши, что хочешь посмотреть:\n"
+    def help_text(uid: int) -> str:
+        if not may_download(st, uid):                  # v8: лёгкий режим — списки и подбор
+            return ("Я помогаю выбрать, что посмотреть:\n"
+                    "• напиши название фильма или имя актёра — покажу карточку, её можно добавить в список "
+                    "(«➕ В список») и оценить;\n"
+                    "• описание сюжета — <i>/plot мужик находит маску и становится зелёным</i>;\n"
+                    "• /podbor — подобрать по жанру, годам и стране;\n"
+                    "• /sovet — что посмотреть: похожее на любимое, вместе с группой, по запросу;\n"
+                    "• /random — случайный фильм.\n\n"
+                    "/lists — мои списки и подборки, списки групп\n"
+                    "/gruppy — группы с семьёй и друзьями (общие списки)\n"
+                    "/ocenki — мои оценки\n"
+                    "/id — твой Telegram ID")
+        return ("Напиши, что хочешь посмотреть:\n"
                 "• название — <i>Маска</i> (год не обязателен, покажу варианты на выбор);\n"
                 "• имя актёра или режиссёра — <i>Джим Керри</i>, покажу его фильмы;\n"
                 "• описание сюжета — <i>/plot мужик находит маску и становится зелёным</i>;\n"
                 "• /podbor — подобрать по жанру, годам и стране;\n"
-                "• /want — что семья хочет посмотреть (👍), /random — что посмотреть сегодня;\n"
+                "• /sovet — что посмотреть: похожее на любимое, вместе с группой, по запросу;\n"
+                "• /random — что посмотреть сегодня;\n"
                 "• /voices — любимые озвучки: такие раздачи будут первыми со ⭐;\n"
                 "• magnet-ссылку — поставлю сразу.\n\n"
+                "/lists — мои списки и подборки, списки групп (/want)\n"
+                "/gruppy — группы с семьёй и друзьями\n"
                 "/status — что сейчас качается (там же можно отменить)\n"
-                + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](u.id) else "")
+                + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](uid) else "")
                 + "/ocenki — что смотрели и оценки (у каждого своя)\n"
+                + "/podpiski — подписки на сериалы и «жду хорошую раздачу»\n"
+                + ("/tv — пульт от телевизора\n" if st.hooks["may_remote"](uid) else "")
                 + "/id — твой Telegram ID")
+
+    @r.message(CommandStart())
+    async def start(msg: Message, bot: Bot, command: CommandObject):
+        u = msg.from_user
+        arg = (command.args or "").strip()
+        if st.is_allowed(u.id):
+            st.db.touch(u.id)
+            if arg[:2] in ("g_", "l_"):                # v8: приглашение в группу / открытый список
+                await msg.answer(await lists.accept_invite(bot, st, u.id, arg))
+                return
+            await msg.answer(help_text(u.id))
             return
         if st.db.is_blocked(u.id):
             await msg.answer("Доступ закрыт.")
             return
         name = u.full_name + (f" (@{u.username})" if u.username else "")
+        note = lists.invite_note(st, arg) if arg[:2] in ("g_", "l_") else ""
+        if note:
+            st.db.set_pref(u.id, "v8_invite", arg)    # после одобрения — сразу в группу / список
         if not st.db.add_request(u.id, name):
             await msg.answer("Запрос уже отправлен — жди, администратор ответит.")
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Разрешить", callback_data=f"ok:{u.id}"),
+            InlineKeyboardButton(text="✅ + ⬇ качать", callback_data=f"okd:{u.id}")], [
             InlineKeyboardButton(text="❌ Отказать", callback_data=f"no:{u.id}"),
             InlineKeyboardButton(text="⛔ Блок", callback_data=f"bn:{u.id}"),
         ]])
         for a in cfg.admin_ids:
             try:
-                await bot.send_message(a, f"Запрос доступа: {esc(name)}, ID <code>{u.id}</code>", reply_markup=kb)
+                await bot.send_message(a, f"Запрос доступа: {esc(name)}, ID <code>{u.id}</code>"
+                                          + (f"\n🔗 {esc(note)}" if note else ""), reply_markup=kb)
             except Exception as e:
                 log.warning("не смог написать админу %s: %s", a, e)
         await msg.answer("Запрос отправлен администратору. Как только он подтвердит — я напишу.")
 
     async def decide(bot: Bot, action: str, uid: int) -> str:
         """Общая логика для кнопок в уведомлении и в /users."""
-        if action == "ok":
+        if action in ("ok", "okd"):
             row = next((q for q in st.db.requests() if q["id"] == uid), None)
             name = row["name"] if row else ""
             if not name:
@@ -431,11 +518,18 @@ def build_router(st: State) -> Router:
                 except Exception:
                     name = ""
             st.db.allow(uid, name)
+            if action == "okd":                        # v8: сразу с правом качать
+                st.db.set_flag(uid, DL, True)
+            invite = st.db.pref(uid, "v8_invite")
             try:
-                await bot.send_message(uid, "Доступ открыт 🎬 Напиши название фильма.")
+                await bot.send_message(uid, "Доступ открыт 🎬\n\n" + help_text(uid))
+                if invite:
+                    st.db.set_flag(uid, "v8_invite", False)
+                    await bot.send_message(uid, await lists.accept_invite(bot, st, uid, invite))
             except Exception:
                 pass
-            return "✅ разрешено"
+            return "✅ разрешено" + ("" if may_download(st, uid) else " (без права качать — включить в /users)")
+        st.db.set_flag(uid, "v8_invite", False)
         if action == "no":
             st.db.drop_request(uid)
             try:
@@ -446,7 +540,7 @@ def build_router(st: State) -> Router:
         st.db.block(uid)
         return "⛔ заблокирован"
 
-    @r.callback_query(F.data.regexp(r"^(ok|no|bn):\d+$"))
+    @r.callback_query(F.data.regexp(r"^(ok|okd|no|bn):\d+$"))
     async def approve(cb: CallbackQuery, bot: Bot):
         if not is_admin(cb.from_user.id):
             await cb.answer("Только для администратора", show_alert=True)
@@ -473,16 +567,21 @@ def build_router(st: State) -> Router:
         text, kb = await users_view(st)
         await msg.answer(text, reply_markup=kb)
 
-    @r.callback_query(F.data.regexp(r"^(urv|ubl|uub|uok|uno|udl):\d+$|^uref$"))
+    @r.callback_query(F.data.regexp(r"^(urv|ubl|uub|uok|uno|udl|udw|uai|urm|ukd|uc):\d+(:c)?$|^uref$"))
     async def users_action(cb: CallbackQuery, bot: Bot):
         if not is_admin(cb.from_user.id):
             await cb.answer("Только для администратора", show_alert=True)
             return
         note = "Обновлено"
+        card_uid = None
         if cb.data != "uref":
-            action, uid = cb.data.split(":")
-            uid = int(uid)
-            if action == "urv":
+            parts = cb.data.split(":")
+            action, uid = parts[0], int(parts[1])
+            if len(parts) > 2 or action == "uc":
+                card_uid = uid                          # остаёмся в карточке человека
+            if action == "uc":
+                note = ""
+            elif action == "urv":
                 st.db.revoke(uid)
                 note = "Доступ убран (сможет попросить снова)"
             elif action == "ubl":
@@ -497,12 +596,40 @@ def build_router(st: State) -> Router:
                         await bot.send_message(uid, "🗑 Администратор разрешил тебе удалять скачанное: /delete")
                     except Exception:
                         pass
+            elif action == "udw":
+                on = not st.db.flag(uid, DL)
+                st.db.set_flag(uid, DL, on)
+                note = "Теперь может качать" if on else "Больше не может качать (только списки и подбор)"
+                if on:
+                    try:
+                        await bot.send_message(uid, "⬇ Администратор разрешил тебе качать фильмы на домашний сервер. "
+                                                    "Найди фильм по названию — покажу раздачи. Справка — /start")
+                    except Exception:
+                        pass
+            elif action == "uai":
+                on = not st.db.flag(uid, AI_FLAG)
+                st.db.set_flag(uid, AI_FLAG, on)
+                note = "🤖 Отмечен для ИИ" if on else "Отметка ИИ снята"
+            elif action == "urm":
+                on = not st.db.flag(uid, remote.REMOTE)
+                st.db.set_flag(uid, remote.REMOTE, on)
+                note = "Теперь у него есть пульт (/tv)" if on else "Пульт отключён"
+                if on:
+                    try:
+                        await bot.send_message(uid, "📺 Администратор дал тебе пульт от ТВ: /tv")
+                    except Exception:
+                        pass
+            elif action == "ukd":
+                on = not st.db.flag(uid, kids.KIDS)
+                st.db.set_flag(uid, kids.KIDS, on)
+                note = "🧸 Детский режим включён" if on else "Детский режим выключен"
             elif action == "uub":
                 st.db.unblock(uid)
                 note = "Разблокирован (может снова попросить доступ)"
             else:
                 note = await decide(bot, action[1:], uid)
-        text, kb = await users_view(st)
+        view = await user_card(st, card_uid) if card_uid is not None else None
+        text, kb = view or await users_view(st)
         try:
             await cb.message.edit_text(text, reply_markup=kb)
         except Exception:                      # «message is not modified»
@@ -529,6 +656,9 @@ def build_router(st: State) -> Router:
         if not await guard(msg):
             return
         uid = msg.from_user.id
+        if not may_download(st, uid):
+            await msg.answer(NO_DL)
+            return
         try:
             torrents = await st.tr.get()
         except Exception as e:
@@ -677,40 +807,73 @@ def build_router(st: State) -> Router:
         if sid not in st.searches:
             await cb.answer("Поиск устарел, повтори запрос", show_alert=True)
             return
+        if not may_download(st, cb.from_user.id):
+            await cb.answer(NO_DL, show_alert=True)
+            return
         rel = st.searches[sid][2][int(idx)]
         info = st.searches[sid][3]
+        exact = bool(info and tmdb.matches(info, rel.title, rel.is_series))
+        ok, why = await kids.allowed(st, cb.from_user.id, info if exact else None)
+        if not ok:
+            await cb.answer(why, show_alert=True)
+            return
         # своя папка «Название (год)» — если раздача точно про найденный в TMDB фильм
-        sub = tmdb.folder_name(info) if info and tmdb.matches(info, rel.title, rel.is_series) else None
+        sub = tmdb.folder_name(info) if exact else None
         if not sub and rel.is_series:
             # сериалу нужна своя папка с человеческим именем: по ней Kodi узнаёт сериал
             sub = tmdb.safe_folder(jacred.ru_title(rel.title))
-        await add_magnet(cb.message, cb.from_user.id, rel.magnet, rel.title, rel.is_series,
-                         info.poster if info else None, sub)
-        await cb.answer("Добавлено")
+        await cb.answer("Добавляю…")
+        await enqueue(cb.bot, cb.from_user.id, cb.message.chat.id, rel.magnet, rel.title, rel.is_series,
+                      info.poster if info else None, sub, size=rel.size, details=rel.details or None,
+                      tmdb_kind=("t" if info.is_tv else "m") if exact else None,
+                      tmdb_id=info.tmdb_id if exact else None)
 
     async def add_magnet(msg: Message, uid: int, magnet: str, title: str, is_series: bool,
                          poster: str | None = None, subfolder: str | None = None):
+        await enqueue(msg.bot, uid, msg.chat.id, magnet, title, is_series, poster, subfolder)
+
+    async def enqueue(bot: Bot, uid: int, chat_id: int, magnet: str, title: str, is_series: bool,
+                      poster: str | None = None, subfolder: str | None = None, size: int = 0,
+                      details: str | None = None, tmdb_kind: str | None = None, tmdb_id: int | None = None,
+                      sub_id: int | None = None, quiet: bool = False) -> str | None:
+        """Поставить на закачку. Проверяет место (если размер известен). Вернёт hash или None.
+        quiet — без сообщения «Поставил» (подписки и «ждать качество» пишут своё)."""
+        if not quiet and not may_download(st, uid):
+            await bot.send_message(chat_id, NO_DL)
+            return None
         folder = cfg.dir_series if is_series else cfg.dir_movies
         if subfolder:
             folder = f"{folder.rstrip('/')}/{subfolder}"
+        job = dict(uid=uid, chat_id=chat_id, magnet=magnet, title=title, is_series=is_series, poster=poster,
+                   subfolder=subfolder, size=size, details=details, tmdb_kind=tmdb_kind, tmdb_id=tmdb_id,
+                   sub_id=sub_id, quiet=quiet)
+        if size:
+            avail, left = await space.room(st, cfg.dir_series if is_series else cfg.dir_movies)
+            if avail is not None and avail < size:
+                await space.refuse(bot, st, {**job, "folder": cfg.dir_series if is_series else cfg.dir_movies},
+                                   avail, left)
+                return None
         try:
             h, name, dup = await st.tr.add(magnet, folder)
         except (TransmissionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            await msg.answer(f"❌ Не удалось добавить в Transmission: {esc(str(e))}")
-            return
+            await bot.send_message(chat_id, f"❌ Не удалось добавить в Transmission: {esc(str(e))}")
+            return None
         if dup:
-            await msg.answer(f"Это уже есть в закачках: <b>{esc(name or title)}</b>")
-            return
-        st.db.add_download(h, name, title, "series" if is_series else "movies", msg.chat.id, uid, poster,
-                           subfolder)
-        kind = "сериалы" if is_series else "фильмы"
-        where = f"\n📁 {esc(subfolder)}" if subfolder else ""
-        await send_with_poster(msg.bot, st, msg.chat.id,
-                               f"⬇ Поставил на закачку ({kind}):\n<b>{esc(title[:200])}</b>{where}\n\n"
-                               f"Напишу, когда скачается. Прогресс — /status", poster,
-                               reply_markup=cancel_kb(h, is_series))
-        if cfg.notify_adds and not is_admin(uid):
-            await notify_admins_add(msg.bot, uid, h, title, is_series, poster, subfolder)
+            if not quiet:
+                await bot.send_message(chat_id, f"Это уже есть в закачках: <b>{esc(name or title)}</b>")
+            return h if quiet else None
+        st.db.add_download(h, name, title, "series" if is_series else "movies", chat_id, uid, poster,
+                           subfolder, details, tmdb_kind, tmdb_id, sub_id)
+        if not quiet:
+            kind = "сериалы" if is_series else "фильмы"
+            where = f"\n📁 {esc(subfolder)}" if subfolder else ""
+            await send_with_poster(bot, st, chat_id,
+                                   f"⬇ Поставил на закачку ({kind}):\n<b>{esc(title[:200])}</b>{where}\n\n"
+                                   f"Напишу, когда скачается. Прогресс — /status", poster,
+                                   reply_markup=cancel_kb(h, is_series, subscribe=is_series))
+        if cfg.notify_adds and not is_admin(uid) and not quiet:
+            await notify_admins_add(bot, uid, h, title, is_series, poster, subfolder)
+        return h
 
     async def notify_admins_add(bot: Bot, uid: int, h: str, title: str, is_series: bool,
                                 poster: str | None, subfolder: str | None) -> None:
@@ -733,23 +896,52 @@ def build_router(st: State) -> Router:
         sid = st.put_search(label, results, info)
         if back:
             st.back[sid] = back
+        if info and info.tmdb_id and results and max((x.height or 0) for x in results) < cfg.wait_min_height:
+            st.wait_hint[sid] = ("t" if info.is_tv else "m", info.tmdb_id)       # кнопка «⏳ ждать качество»
+            for k in [k for k in st.wait_hint if k not in st.searches]:
+                del st.wait_hint[k]
         text, kb = render_page(st, sid, 0)
         if note:
             text = f"{note}\n\n{text}"
         if info and info.poster:
             await send_with_poster(msg.bot, st, msg.chat.id, info.caption(), info.poster,
-                                   reply_markup=await extras.info_kb(st, info))
+                                   reply_markup=await extras.info_kb(st, info, msg.chat.id))
         await msg.answer(text, reply_markup=kb)
 
-    def back_kb(back: str | None) -> InlineKeyboardMarkup | None:
+    def back_kb(back: str | None, info: tmdb.Info | None = None) -> InlineKeyboardMarkup | None:
+        rows = []
+        if info and info.tmdb_id:
+            rows.append([InlineKeyboardButton(text="⏳ Ждать, когда появится хорошая раздача",
+                                              callback_data=f"wt:{'t' if info.is_tv else 'm'}:{info.tmdb_id}")])
         if back and back in st.views:
-            return InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")]])
-        return None
+            rows.append([InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-    async def search_for(msg: Message, info: tmdb.Info, back: str | None = None) -> None:
+    async def show_card(msg: Message, info: tmdb.Info, uid: int, head: str = "", extra: list | None = None) -> None:
+        """v8: карточка фильма (обложка, описание, трейлер, «➕ В список», «⭐ Оценить»).
+        Тем, кто может качать, — ещё «⬇ Найти раздачи»."""
+        lists.remember_info(st, info)
+        kind = "t" if info.is_tv else "m"
+        markup = await extras.info_kb(st, info, uid)
+        rows = list(markup.inline_keyboard) if markup else []
+        if may_download(st, uid):
+            rows.insert(0, [InlineKeyboardButton(text="⬇ Найти раздачи", callback_data=f"Ld:{kind}:{info.tmdb_id}")])
+        rows += extra or []
+        await add_cast(st, [info])
+        text = (f"{head}\n\n" if head else "") + info.caption(500 if head else 600)
+        await send_with_poster(msg.bot, st, msg.chat.id, text, info.poster,
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+
+    async def search_for(msg: Message, info: tmdb.Info, back: str | None = None, uid: int | None = None) -> None:
         """Раздачи для выбранного фильма: ищем по русскому и оригинальному
-        названию, оставляем только то, что про этот фильм (название + год)."""
+        названию, оставляем только то, что про этот фильм (название + год).
+        v8: кто не может качать — получает карточку фильма (списки, оценка) вместо раздач."""
+        uid = uid if uid is not None else msg.chat.id
+        if not may_download(st, uid):
+            extra = ([[InlineKeyboardButton(text="◀ К вариантам", callback_data=f"bk:{back}")]]
+                     if back and back in st.views else None)
+            await show_card(msg, info, uid, extra=extra)
+            return
         label = tmdb.short_label(info, 80)
         wait = await msg.answer(f"🔎 Ищу раздачи: {esc(label)}…")
         cast_task = asyncio.create_task(add_cast(st, [info]))     # для подписи к обложке
@@ -771,14 +963,23 @@ def build_router(st: State) -> Router:
         else:
             hint = (f"Нашлось {total} раздач, но ни одна не подходит для приставки "
                     f"(4K/HEVC/слишком большие/мало сидов)." if total else "Раздач не нашлось.")
-            await wait.edit_text(f"{esc(label)}\n{hint}", reply_markup=back_kb(back))
+            st.infos[("t" if info.is_tv else "m", info.tmdb_id)] = info
+            await wait.edit_text(f"{esc(label)}\n{hint}", reply_markup=back_kb(back, info))
             return
         await wait.delete()
         await cast_task
         await show_releases(msg, label, results, info, note, back)
 
-    async def raw_search(msg: Message, query: str) -> None:
+    async def raw_search(msg: Message, query: str, uid: int | None = None) -> None:
         """Старый режим: текст как есть уходит на трекеры, обложка — догадка."""
+        if kids.is_kid(st, uid if uid is not None else msg.chat.id):
+            await msg.answer("В детском режиме ищу только по каталогу фильмов — такого там не нашёл. "
+                             "Попробуй написать название иначе.")
+            return
+        if not may_download(st, uid if uid is not None else msg.chat.id):
+            await msg.answer(f"В каталоге фильмов не нашёл «{esc(query)}». Попробуй написать название иначе "
+                             f"или добавь год.")
+            return
         wait = await msg.answer(f"🔎 Ищу «{esc(query)}»…")
         info_task = asyncio.create_task(find_info(st, query))
         try:
@@ -814,7 +1015,7 @@ def build_router(st: State) -> Router:
         if isinstance(details, BaseException):          # без фото и дат — не беда
             log.info("tmdb person details: %r", details)
             details = {}
-        infos = tmdb.filmography(credits, person.department)
+        infos = kids.only_kids(st, msg.chat.id, tmdb.filmography(credits, person.department, 40))[:12]
         if not infos:
             await wait.edit_text(f"У {esc(person.name)} не нашёл фильмов.")
             return
@@ -834,8 +1035,9 @@ def build_router(st: State) -> Router:
             pass
         await send_with_poster(msg.bot, st, msg.chat.id, text, photo, reply_markup=kb)
 
-    async def plot_search(msg: Message, text: str) -> None:
-        """Описание сюжета → Википедия → варианты фильмов кнопками."""
+    async def plot_search(msg: Message, text: str, uid: int | None = None, use_ai: bool = True) -> None:
+        """Описание сюжета → Gemini (если есть ключ) → иначе/не вышло — Википедия → варианты кнопками."""
+        uid = uid if uid is not None else msg.chat.id
         if not cfg.tmdb_key:
             await msg.answer("Поиск по сюжету работает только с ключом TMDB (TMDB_API_KEY).")
             return
@@ -843,35 +1045,83 @@ def build_router(st: State) -> Router:
             await msg.answer("Опиши сюжет подробнее: кто герой, что происходит, где. "
                              "Например: <i>/plot мужик находит маску и становится зелёным</i>")
             return
-        wait = await msg.answer("📖 Ищу по сюжету…")
+        note = ""
+        why = aictl.check(st, uid, "plot") if (use_ai and st.ai) else "нет"
+        if use_ai and st.ai and why and aictl.feature_on(st, "plot") and st.ai.active():
+            note = f"🤖 {esc(why[0].upper() + why[1:])} — ищу по Википедии.\n\n"     # лимит или не положено
+        if use_ai and st.ai and not why:
+            wait = await msg.answer("🤖 Спрашиваю ИИ…")
+            who = ""
+            try:
+                found, who = await aictl.plot(st, msg.bot, uid, text)
+                infos = kids.only_kids(st, uid, found)
+            except aictl.AiLimit as e:
+                note = f"🤖 {esc(e.reason)} — ищу по Википедии.\n\n"
+                infos = []
+            except ai.AiUnavailable as e:
+                log.info("ИИ: %s", e.reason)
+                note = f"🤖 ИИ сейчас недоступен ({esc(e.reason)}) — ищу по Википедии.\n\n"
+                infos = []
+            except Exception as e:
+                log.warning("ИИ: %r", e)
+                note = "🤖 ИИ сейчас недоступен — ищу по Википедии.\n\n"
+                infos = []
+            else:
+                if not infos:
+                    note = "🤖 ИИ не узнал фильм — ищу по Википедии.\n\n"
+            if infos:
+                cid = st.put_choice(text[:100], infos, [])
+                await add_cast(st, infos)
+                t, kb = render_choice(f"🤖 По описанию (ИИ{', ' + esc(who) if who else ''}) похоже на:",
+                                      infos, [], cid, None, extra_rows=[[
+                    InlineKeyboardButton(text="📖 Не то — поискать по Википедии", callback_data=f"plotw:{cid}")]])
+                st.remember(cid, t, kb)
+                await wait.edit_text(t, reply_markup=kb)
+                return
+            await wait.edit_text(note + "📖 Ищу по сюжету…")
+        else:
+            wait = await msg.answer(note + "📖 Ищу по сюжету…")
         try:
             infos = await wiki.search_by_plot(st.tmdb_http, cfg.tmdb_key, text, cfg.tmdb_lang)
         except wiki.WikiBusy as e:
             log.info("wiki: %s", e)
             mins = max(1, round(e.seconds / 60))
-            await wait.edit_text(f"Википедия просит подождать ~{mins} мин (слишком много запросов). "
+            await wait.edit_text(f"{note}Википедия просит подождать ~{mins} мин (слишком много запросов). "
                                  f"Попробуй чуть позже.")
             return
         except Exception as e:
             log.warning("wiki: %r", e)
-            await wait.edit_text("Википедия сейчас не отвечает, попробуй позже.")
+            await wait.edit_text(f"{note}Википедия сейчас не отвечает, попробуй позже.")
             return
+        infos = kids.only_kids(st, uid, infos)
         cid = st.put_choice(text[:100], infos, [])
         if not infos:
-            t, kb = render_choice("📖 По описанию ничего не нашёл. Добавь конкретики — имена, предметы, "
+            t, kb = render_choice(f"{note}📖 По описанию ничего не нашёл. Добавь конкретики — имена, предметы, "
                                   "место действия, профессии героев.", [], [], cid, text[:100])
             await wait.edit_text(t, reply_markup=kb)
             return
         await add_cast(st, infos)
-        t, kb = render_choice("📖 По описанию похоже на:", infos, [], cid, None)
+        t, kb = render_choice(f"{note}📖 По описанию (Википедия) похоже на:", infos, [], cid, None)
         st.remember(cid, t, kb)
         await wait.edit_text(t, reply_markup=kb)
+
+    @r.callback_query(F.data.regexp(r"^plotw:[0-9a-f]+$"))
+    async def plot_wiki(cb: CallbackQuery):
+        """«📖 Не то» под ответом ИИ — тот же запрос через Википедию."""
+        if not await guard_cb(cb):
+            return
+        ch = st.choices.get(cb.data[6:])
+        if not ch:
+            await cb.answer("Поиск устарел, повтори запрос", show_alert=True)
+            return
+        await cb.answer()
+        await plot_search(cb.message, ch[1], cb.from_user.id, use_ai=False)
 
     @r.message(Command("plot"))
     async def plot_cmd(msg: Message, command: CommandObject):
         if not await guard(msg):
             return
-        await plot_search(msg, (command.args or "").strip()[:300])
+        await plot_search(msg, (command.args or "").strip()[:300], msg.from_user.id)
 
     # ---------- /podbor ----------
     @r.message(Command("podbor"))
@@ -905,6 +1155,7 @@ def build_router(st: State) -> Router:
             await cb.message.edit_text("TMDB сейчас не отвечает, попробуй позже.")
             return
         label = podbor_label(parts)
+        infos = kids.only_kids(st, cb.from_user.id, infos)
         await add_cast(st, infos[:10])
         cid = st.put_choice(label, infos[:10], [])
         base = "pb:" + ":".join(parts[:5])
@@ -936,13 +1187,13 @@ def build_router(st: State) -> Router:
         except Exception:
             pass
         if parts[0] == "pk":
-            await search_for(cb.message, infos[int(parts[2])], back=parts[1])
+            await search_for(cb.message, infos[int(parts[2])], back=parts[1], uid=cb.from_user.id)
         elif parts[0] == "pp":
             await show_person(cb.message, persons[int(parts[2])])
         elif parts[0] == "plot":
-            await plot_search(cb.message, query)
+            await plot_search(cb.message, query, cb.from_user.id)
         else:
-            await raw_search(cb.message, query)
+            await raw_search(cb.message, query, cb.from_user.id)
 
     @r.callback_query(F.data.regexp(r"^pw:[0-9a-f]{40}$"))
     async def watched_on_pc(cb: CallbackQuery):
@@ -985,33 +1236,41 @@ def build_router(st: State) -> Router:
     async def magnet(msg: Message):
         if not await guard(msg):
             return
+        if kids.is_kid(st, msg.from_user.id):
+            await msg.answer("В детском режиме magnet-ссылки не принимаю — найди мультфильм по названию.")
+            return
+        if not may_download(st, msg.from_user.id):
+            await msg.answer(NO_DL)
+            return
         await add_magnet(msg, msg.from_user.id, msg.text.strip(), "magnet-ссылка", False)
 
     @r.message(F.text & ~F.text.startswith("/"))
     async def search(msg: Message):
         if not await guard(msg):
             return
+        if "text_input" in st.hooks and await st.hooks["text_input"](msg):     # v8: ждали название / запрос к ИИ
+            return
         query = msg.text.strip()[:100]
         if not cfg.tmdb_key:
-            await raw_search(msg, query)
+            await raw_search(msg, query, msg.from_user.id)
             return
         cands = await find_info(st, query)
         if tmdb.is_person_query(query, cands):
             await show_person(msg, tmdb.people(cands, 1)[0])
             return
         _, year = tmdb.split_query(query)
-        infos = tmdb.choices(cands, year)
+        infos = kids.only_kids(st, msg.from_user.id, tmdb.choices(cands, year, 20))[:6]
         persons = tmdb.people(cands)
         # длинный запрос может быть описанием сюжета, а не названием
         maybe_plot = len(wiki.keywords(query)) >= 3
         if len(infos) == 1 and not persons and not maybe_plot:
-            await search_for(msg, infos[0])
+            await search_for(msg, infos[0], uid=msg.from_user.id)
             return
         if not infos and not persons:
             if maybe_plot:
-                await plot_search(msg, query)   # похоже на описание — ищем по сюжету
+                await plot_search(msg, query, msg.from_user.id)   # похоже на описание — ищем по сюжету
             else:
-                await raw_search(msg, query)    # TMDB не знает — ищем как есть
+                await raw_search(msg, query, msg.from_user.id)    # TMDB не знает — ищем как есть
             return
         await add_cast(st, infos)
         cid = st.put_choice(query, infos, persons)
@@ -1020,12 +1279,96 @@ def build_router(st: State) -> Router:
         st.remember(cid, text, kb)
         await msg.answer(text, reply_markup=kb)
 
+    # v8: ждали название подборки/группы, а человек занялся другим — больше не ждём
+    KEEP_INPUT = ("Ln:", "Le:", "Gn", "Ge:", "Ra", "Lk")
+
+    @r.message.outer_middleware()
+    async def reset_input_msg(handler, event, data):
+        if isinstance(event, Message) and (event.text or "").startswith("/") and event.from_user:
+            st.awaiting.pop(event.from_user.id, None)
+        return await handler(event, data)
+
+    @r.callback_query.outer_middleware()
+    async def reset_input_cb(handler, event, data):
+        if isinstance(event, CallbackQuery) and not (event.data or "").startswith(KEEP_INPUT):
+            st.awaiting.pop(event.from_user.id, None)
+        return await handler(event, data)
+
     r.include_router(deleter.build_router(st))
     r.include_router(journal.build_router(st))
-    st.hooks.update(add_magnet=add_magnet, search_for=search_for, can_cancel=can_cancel,
+    r.include_router(remote.build_router(st))
+    r.include_router(subs.build_router(st))
+    r.include_router(space.build_router(st))
+    r.include_router(stall.build_router(st))
+    r.include_router(loadguard.build_router(st))
+    r.include_router(lists.build_router(st))
+    r.include_router(recs.build_router(st))
+    r.include_router(aictl.build_router(st))
+    st.hooks.update(add_magnet=add_magnet, search_for=search_for, can_cancel=can_cancel, show_card=show_card,
+                    may_download=lambda uid: may_download(st, uid),
                     send_with_poster=send_with_poster,
+                    enqueue=lambda bot, **kw: enqueue(bot, **kw),
+                    short_name=lambda uid: deleter.short_name(st, uid),
                     nice_name=lambda t: nice_name(cfg, t, st.db.get(t["hashString"].lower()))[0])
     return r
+
+
+def done_kb(st: State, row, h: str, series: bool) -> InlineKeyboardMarkup | None:
+    """Кнопки под «✅ Скачано»: на ТВ, посмотрели на ПК, подписка на сериал."""
+    rows = []
+    if st.kodi and row["user_id"] and st.hooks.get("may_remote", lambda _: False)(row["user_id"]):
+        rows.append([InlineKeyboardButton(text="▶ Включить на ТВ", callback_data=f"tvp:{h}")])
+    if st.kodi:
+        rows.append([InlineKeyboardButton(text=journal.PC_BUTTON, callback_data=f"pw:{h}")])
+    if series and not row["sub_id"]:
+        rows.append([InlineKeyboardButton(text="🔔 Следить за новыми сериями", callback_data=f"sb:{h}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def watch_once(bot: Bot, st: State) -> None:
+    """Одна проверка: что докачалось, что зависло, у чего кончилось место."""
+    pending = {row["hash"]: row for row in st.db.pending()}
+    if not pending:
+        return
+    torrents = {t["hashString"].lower(): t for t in await st.tr.get(list(pending))}
+    finished_any = False
+    for h, row in pending.items():
+        t = torrents.get(h)
+        if t is None:
+            st.db.mark_removed(h)
+            continue
+        if t["percentDone"] >= 1:
+            st.db.mark_done(h)
+            st.progress.pop(h, None)
+            finished_any = True
+            name, series = nice_name(st.cfg, t, row)
+            st.db.journal_note("series" if series else "movies", name, row["poster"],
+                               row["user_id"], h=h, tmdb_kind=row["tmdb_kind"], tmdb_id=row["tmdb_id"])
+            raw = t.get("name") or ""
+            raw_line = f"\n<i>{esc(raw[:300])}</i>" if raw and raw != name else ""
+            text = (f"✅ Скачано: {'📺' if series else '🎬'} <b>{esc(name[:200])}</b> "
+                    f"({fmt_size(t.get('sizeWhenDone') or t['totalSize'])}){raw_line}\n"
+                    f"Уже можно смотреть на ТВ.")
+            await send_with_poster(bot, st, row["chat_id"], text, row["poster"],
+                                   reply_markup=done_kb(st, row, h, series))
+            if row["sub_id"]:                              # подписка — остальным подписчикам тоже
+                for u in st.db.sub_users(row["sub_id"]):
+                    if u["chat_id"] != row["chat_id"]:
+                        try:
+                            await send_with_poster(bot, st, u["chat_id"], text, row["poster"])
+                        except Exception:
+                            pass
+            asyncio.create_task(remote.notify_done(st, name, series))
+            continue
+        if space.is_nospace(t) and not row["nospace_at"]:
+            st.db.set_download(h, nospace_at=int(time.time()))
+            await space.nospace_notify(bot, st, row, nice_name(st.cfg, t, row)[0])
+        elif not t.get("error") and row["nospace_at"]:
+            st.db.set_download(h, nospace_at=None)         # место освободили, закачка пошла
+    await stall.check(bot, st, torrents, {h: r for h, r in pending.items()
+                                          if h in torrents and torrents[h]["percentDone"] < 1})
+    if finished_any and st.kodi:
+        remote.kodi_request(st, "scan", delay=20)        # пока Transmission переносит файлы
 
 
 async def watcher(bot: Bot, st: State):
@@ -1033,45 +1376,9 @@ async def watcher(bot: Bot, st: State):
     while True:
         await asyncio.sleep(st.cfg.poll_interval)
         try:
-            pending = {row["hash"]: row for row in st.db.pending()}
-            if not pending:
-                continue
-            torrents = {t["hashString"].lower(): t for t in await st.tr.get(list(pending))}
-            finished_any = False
-            for h, row in pending.items():
-                t = torrents.get(h)
-                if t is None:
-                    st.db.mark_removed(h)
-                    continue
-                if t["percentDone"] >= 1:
-                    st.db.mark_done(h)
-                    finished_any = True
-                    name, series = nice_name(st.cfg, t, row)
-                    st.db.journal_note("series" if series else "movies", name, row["poster"],
-                                       row["user_id"], h=h)
-                    raw = t.get("name") or ""
-                    raw_line = f"\n<i>{esc(raw[:300])}</i>" if raw and raw != name else ""
-                    await send_with_poster(
-                        bot, st, row["chat_id"],
-                        f"✅ Скачано: {'📺' if series else '🎬'} <b>{esc(name[:200])}</b> "
-                        f"({fmt_size(t['totalSize'])}){raw_line}\n"
-                        f"Уже можно смотреть на ТВ.", row["poster"],
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                            text=journal.PC_BUTTON, callback_data=f"pw:{h}")]]) if st.kodi else None)
-            if finished_any and st.kodi:
-                asyncio.create_task(kodi_scan_later(st))
+            await watch_once(bot, st)
         except Exception as e:
             log.warning("watcher: %r", e)
-
-
-async def kodi_scan_later(st: State, delay: int = 20) -> None:
-    """Через несколько секунд (пока Transmission переносит файлы) — обновить медиатеку Kodi."""
-    await asyncio.sleep(delay)
-    try:
-        await st.kodi.scan()
-        log.info("Kodi: запущено обновление медиатеки")
-    except Exception as e:
-        log.info("Kodi: не удалось обновить медиатеку: %s", e)
 
 
 def _torrent_root(t: dict) -> str:
@@ -1173,8 +1480,7 @@ async def cleanup_once(bot: Bot, st: State) -> None:
                                           f"(освободилось {fmt_size(t.get('totalSize', 0))})")
             await journal.ask(bot, st, row["jid"], row["user_id"], row["chat_id"], "cleanup")   # тот, кто ставил
     if removed_any:
-        await asyncio.sleep(10)
-        await st.kodi.clean()
+        remote.kodi_request(st, "clean", delay=10)
 
 
 WATCH_SEEDED = "rate_watch_seeded"      # prefs(user_id=0): первый проход проверки уже был
@@ -1189,6 +1495,10 @@ async def rating_watch_once(bot: Bot, st: State) -> int:
     for row, t, v in await _judge_all(st):
         if v.status != "watched" or not row["jid"] or not row["user_id"]:
             continue
+        try:
+            lists.mark_kodi_watched(st, row)          # v8: ✅ в списках того, кто качал (и его групп)
+        except Exception as e:
+            log.info("списки: отметка просмотренного: %r", e)
         if not seeded:
             st.db.note_ask(row["jid"], row["user_id"], "migrated")
         elif await journal.ask(bot, st, row["jid"], row["user_id"], row["chat_id"], "watched"):
@@ -1234,6 +1544,24 @@ async def run() -> None:
         from aiohttp_socks import ProxyConnector
         tmdb_http = aiohttp.ClientSession(connector=ProxyConnector.from_url(cfg.tmdb_proxy, rdns=True))
     st = State(cfg, db, tr, jac_http, tmdb_http)
+    ai_sessions: dict[str, aiohttp.ClientSession] = {}
+
+    def session_for(proxy: str | None) -> aiohttp.ClientSession:
+        from aiohttp_socks import ProxyConnector
+        return aiohttp.ClientSession(connector=ProxyConnector.from_url(proxy, rdns=True) if proxy else None)
+    if cfg.yandex_key and cfg.yandex_folder:
+        ai_sessions["yandex"] = aiohttp.ClientSession()             # Яндекс — напрямую
+    if cfg.groq_key:
+        ai_sessions["groq"] = session_for(cfg.groq_proxy)
+    if cfg.gemini_key:
+        ai_sessions["gemini"] = session_for(cfg.gemini_proxy)
+    st.ai = ai.Chain(cfg, ai_sessions)
+    aictl.apply(st)                                # выключенные в /ai сервисы
+    try:
+        lists.setup(st)                            # v8: «Хотим посмотреть» → группа «Семья» (один раз)
+    except Exception as e:
+        log.warning("v8: перенос «Хотим посмотреть» не получился: %r", e)
+    log.info("ИИ для поиска по описанию: %s", st.ai.status() if st.ai else "нет ключей — только Википедия")
     kodi_http = None
     if cfg.kodi_url:
         kodi_http = aiohttp.ClientSession()
@@ -1251,12 +1579,16 @@ async def run() -> None:
     await bot.set_my_commands([
         BotCommand(command="status", description="Что сейчас качается (и отмена)"),
         BotCommand(command="podbor", description="Подобрать по жанру, годам, стране"),
-        BotCommand(command="want", description="Хотим посмотреть (голосование)"),
+        BotCommand(command="lists", description="Мои списки и подборки, списки групп"),
+        BotCommand(command="sovet", description="Что посмотреть: похожее, вместе, по запросу"),
+        BotCommand(command="gruppy", description="Группы: семья, друзья"),
         BotCommand(command="random", description="Что посмотреть сегодня"),
         BotCommand(command="voices", description="Любимые озвучки"),
         BotCommand(command="plot", description="Найти фильм по описанию сюжета"),
         BotCommand(command="delete", description="Удалить скачанное (освободить место)"),
         BotCommand(command="ocenki", description="Что смотрели и оценки"),
+        BotCommand(command="podpiski", description="Подписки на сериалы, «жду качество»"),
+        BotCommand(command="tv", description="Пульт от телевизора"),
         BotCommand(command="id", description="Мой Telegram ID"),
         BotCommand(command="start", description="Справка"),
     ])
@@ -1270,6 +1602,10 @@ async def run() -> None:
                                 "download-queue-size": max(cfg.queue_size, 1)})
     except Exception as e:
         log.warning("не удалось настроить очередь Transmission: %r", e)
+    tasks.append(asyncio.create_task(subs.loop(bot, st)))
+    tasks.append(asyncio.create_task(loadguard.guard_loop(bot, st)))
+    if st.kodi:
+        tasks.append(asyncio.create_task(remote.kodi_sync_loop(st)))
     if st.kodi and cfg.rate_watch_minutes > 0:
         tasks.append(asyncio.create_task(rating_watch(bot, st)))
     if st.kodi and cfg.cleanup_days > 0:
@@ -1286,6 +1622,8 @@ async def run() -> None:
         await tr_http.close()
         if tmdb_http:
             await tmdb_http.close()
+        for sess in ai_sessions.values():
+            await sess.close()
         await bot.session.close()
 
 

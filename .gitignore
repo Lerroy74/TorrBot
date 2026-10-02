@@ -5,3 +5,5 @@ data/
 transmission/
 extra/*.sh
 *.bak
+pi/secrets.env
+host/*.pyc

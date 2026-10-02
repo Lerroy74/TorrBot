@@ -76,19 +76,21 @@ async def test_poster_buttons_trailer_collection_wish(env):
     poster = next(m for m in session.calls if type(m).__name__ in ("SendPhoto", "SendMessage")
                   and getattr(m, "reply_markup", None) and any("Трейлер" in b.text for b in buttons(m.reply_markup)))
     labels = {b.text: (b.url or b.callback_data) for b in buttons(poster.reply_markup)}
-    assert labels["🎞 Трейлер"].endswith("v=x") and labels["⭐ Хотим посмотреть"] == "wl:m:105"
+    assert labels["🎞 Трейлер"].endswith("v=x") and labels["➕ В список"] == "La:m:105"
+    assert labels["⭐ Оценить"] == "Lr:0:m:105:0:0"
     assert labels["📚 Все части: Назад в будущее (коллекция)"] == "col:264"
 
-    # «хотим»: Алиса добавила, Боб проголосовал, список по голосам
-    await press(ALICE, "wl:m:105")
-    await press(BOB, "wl:m:105")
-    await send(BOB, "/want")
-    _, text, kb = session.sent(BOB)[-1]
-    assert "Назад в будущее (1985) — 👍 2" in text and "Алиса" in text and "Боб" in text
-    await press(BOB, "wr:m:105")                               # чужое не удаляет
-    assert "добавил" in session.alerts()[-1] and st.db.wishlist()
-    await press(ALICE, "wr:m:105")
-    assert not st.db.wishlist()
+    # v8: «➕ В список» → выбор списка → фильм в личном «Хочу посмотреть»; /want открывает списки
+    await press(ALICE, "La:m:105")
+    _, text, kb = session.sent(ALICE)[-1]
+    assert "Куда добавить" in text and "Назад в будущее" in text
+    target = next(b.callback_data for b in buttons(kb) if b.text.startswith("Хочу посмотреть"))
+    await press(ALICE, target)
+    assert st.db.list_item(st.db.main_list(ALICE), "m", 105) is not None
+    await send(ALICE, "/want")
+    assert "Хочу посмотреть — 1" in session.sent(ALICE)[-1][1]
+    await press(BOB, "wr:m:105")                               # старые кнопки — подсказка про /lists
+    assert "/lists" in session.alerts()[-1]
 
     # все части: одна нашлась, другая нет
     async def fake_col(http, key, cid, lang="ru-RU"):

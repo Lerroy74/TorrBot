@@ -105,7 +105,9 @@ def build_router(st) -> Router:
         return uid in cfg.admin_ids
 
     def may_delete(uid: int) -> bool:
-        return is_admin(uid) or (st.is_allowed(uid) and st.db.can_delete(uid))
+        # v8: домашний диск — только у тех, кто может качать
+        return is_admin(uid) or (st.is_allowed(uid) and st.db.can_delete(uid)
+                                 and st.hooks.get("may_download", lambda _: True)(uid))
 
     st.hooks["may_delete"] = may_delete
 
@@ -198,7 +200,7 @@ def build_router(st) -> Router:
             return "\n⚪ Ещё не смотрели"
         return "\n❔ В медиатеке Kodi не найдено"
 
-    async def card(lid: str, idx: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    async def card(lid: str, idx: int, uid: int | None = None) -> tuple[str, InlineKeyboardMarkup] | None:
         got = pick(lid, idx, -1)
         if not got:
             return None
@@ -224,6 +226,8 @@ def build_router(st) -> Router:
                 rows.append([B(text=f"🗑 {s.name[:40]} ({fmt_size(s.size)})", callback_data=f"ld:{lid}:{idx}:{si}")])
         if st.kodi and seen and "Просмотрено" not in seen and "не ответил" not in seen:
             rows.append([B(text=journal.PC_BUTTON, callback_data=f"lw:{lid}:{idx}")])
+        if st.kodi and uid is not None and "play_token" in st.hooks and st.hooks["may_remote"](uid) and prog is None:
+            rows.append([B(text="▶ Включить на ТВ", callback_data=f"tvf:{st.hooks['play_token'](e.path)}")])
         rows.append([B(text="◀ К списку", callback_data=f"lb:{lid}:{idx // PAGE}")])
         return text, kb(rows)
 
@@ -312,7 +316,7 @@ def build_router(st) -> Router:
         if await refuse(cb):
             return
         _, lid, idx = cb.data.split(":")
-        got = await card(lid, int(idx))
+        got = await card(lid, int(idx), cb.from_user.id)
         if not got:
             await cb.answer("Список устарел — открываю заново")
             return await _reload(cb)
@@ -359,7 +363,7 @@ def build_router(st) -> Router:
             return await _reload(cb)
         await cb.answer()
         jid = journal_id(lid, got[0])
-        c = await card(lid, int(idx))
+        c = await card(lid, int(idx), cb.from_user.id)
         if c:
             await edit(cb, *c)
         await journal.ask(bot, st, jid, cb.from_user.id, cb.message.chat.id, "pc", force=True)
@@ -446,7 +450,8 @@ def build_router(st) -> Router:
         await journal.ask(bot, st, jid, uid, cb.message.chat.id, "delete", force=True)
         await journal.ask_many(bot, st, jid, sorted(owners), "delete")
         if st.kodi:
-            asyncio.create_task(kodi_clean_later(st))
+            from .remote import kodi_request
+            kodi_request(st, "clean", delay=10)
         who = short_name(st, uid) or str(uid)
         if cfg.notify_deletes and not is_admin(uid):
             for a in cfg.admin_ids:
@@ -463,13 +468,3 @@ def build_router(st) -> Router:
                     pass
 
     return r
-
-
-async def kodi_clean_later(st, delay: int = 10) -> None:
-    """Убрать удалённое из медиатеки Kodi (чтобы на ТВ не висели «мёртвые» фильмы)."""
-    await asyncio.sleep(delay)
-    try:
-        await st.kodi.clean()
-        log.info("Kodi: чистка медиатеки после удаления")
-    except Exception as ex:
-        log.info("Kodi: не удалось почистить медиатеку: %s", ex)

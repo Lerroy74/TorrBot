@@ -78,6 +78,44 @@ class Config:
     notify_adds: bool = True       # сообщать админам, когда пользователь ставит закачку
     notify_deletes: bool = True    # сообщать админам, когда пользователь удаляет через /delete
 
+    # v7
+    kodi_retry_min: int = 5            # Kodi не ответил на «обнови медиатеку» — повтор через N мин
+    kodi_notify: bool = True           # всплывающее сообщение на ТВ, когда закачка готова
+    gemini_key: str | None = None
+    gemini_model: str = "gemini-3.8-flash"
+    gemini_proxy: str | None = None
+    # v7.1: цепочка ИИ (по порядку; кончился лимит — следующий)
+    ai_order: tuple[str, ...] = ("yandex", "groq", "gemini")
+    yandex_key: str | None = None
+    yandex_folder: str | None = None
+    yandex_model: str = "aliceai-llm/latest"
+    yandex_url: str = "https://ai.api.cloud.yandex.net/v1"
+    groq_key: str | None = None
+    groq_model: str = "openai/gpt-oss-120b"
+    groq_proxy: str | None = None
+    subs_check_hours: float = 6        # как часто проверять подписки на сериалы
+    subs_fallback_days: int = 7        # серия вышла N дней назад, а раздача не обновилась — предложить другие
+    wait_check_hours: float = 12       # «⏳ ждать хорошее качество»: как часто искать
+    wait_min_height: int = 1080
+    wait_days: int = 180               # сколько ждать, потом забыть
+    kids_max_age: int = 12             # детский режим: возрастной рейтинг не выше
+    disk_reserve_gb: float = 5         # запас места, который не занимаем закачками
+    stall_hours: float = 3             # закачка без движения N часов — предложить другие раздачи
+    turtle_down_mb: float = 5          # «черепаха»: МБ/с на закачку
+    turtle_up_mb: float = 1            # «черепаха»: МБ/с на раздачу
+    day_hours: str = "08:00-23:00"     # дневной режим: когда притормаживать
+    load_file: str = "/data/host-load.json"   # что пишет агент нагрузки на сервере
+    load_util: int = 90                # диск занят на столько % и больше — перегрузка
+    load_alert_sec: int = 120          # …столько секунд подряд
+    load_throttle_min: int = 15        # притормозили из-за перегрузки — не меньше N минут
+    load_cooldown_min: int = 30        # повтор тревоги о перегрузке не чаще
+    net_limit_mbit: int = 300          # тариф: канал считаем забитым от 90% этого
+    # v8: контроль ИИ (стартовые значения; дальше меняются в /ai)
+    ai_user_day: int = 10              # ИИ-запросов в день на человека (0 — без лимита)
+    ai_total_day: int = 50             # ИИ-запросов в день на всех (0 — без лимита)
+    ai_month_rub: float = 0            # месячный потолок, ₽ (0 — выкл)
+    ai_prices: tuple = ()              # ((сервис, ₽ за 1000 токенов), …); не задано — сумму не считаем
+
 
 def load() -> Config:
     token = _str("BOT_TOKEN")
@@ -135,4 +173,39 @@ def load() -> Config:
         max_results=int(_str("MAX_RESULTS", "30")),
         db_path=_str("DB_PATH", "/data/bot.sqlite3"),
         poll_interval=int(_str("POLL_INTERVAL", "60")),
+        kodi_retry_min=int(_str("KODI_RETRY_MIN", "5")),
+        kodi_notify=_bool("KODI_NOTIFY", True),
+        gemini_key=_str("GEMINI_API_KEY") or None,
+        gemini_model=_str("GEMINI_MODEL", "gemini-3.8-flash"),
+        gemini_proxy=_str("GEMINI_PROXY") or _str("TMDB_PROXY") or _str("TG_PROXY") or None,
+        ai_order=tuple(x.lower() for x in _list("AI_ORDER", "yandex,groq,gemini")),
+        yandex_key=_str("YANDEX_API_KEY") or None,
+        yandex_folder=_str("YANDEX_FOLDER_ID") or None,
+        yandex_model=_str("YANDEX_MODEL", "aliceai-llm/latest"),
+        yandex_url=_str("YANDEX_URL", "https://ai.api.cloud.yandex.net/v1").rstrip("/"),
+        groq_key=_str("GROQ_API_KEY") or None,
+        groq_model=_str("GROQ_MODEL", "openai/gpt-oss-120b"),
+        groq_proxy=_str("GROQ_PROXY") or _str("TMDB_PROXY") or _str("TG_PROXY") or None,
+        subs_check_hours=float(_str("SUBS_CHECK_HOURS", "6")),
+        subs_fallback_days=int(_str("SUBS_FALLBACK_DAYS", "7")),
+        wait_check_hours=float(_str("WAIT_CHECK_HOURS", "12")),
+        wait_min_height=int(_str("WAIT_MIN_HEIGHT", "1080")),
+        wait_days=int(_str("WAIT_DAYS", "180")),
+        kids_max_age=int(_str("KIDS_MAX_AGE", "12")),
+        disk_reserve_gb=float(_str("DISK_RESERVE_GB", "5")),
+        stall_hours=float(_str("STALL_HOURS", "3")),
+        turtle_down_mb=float(_str("TURTLE_DOWN_MB", "5")),
+        turtle_up_mb=float(_str("TURTLE_UP_MB", "1")),
+        day_hours=_str("DAY_HOURS", "08:00-23:00"),
+        load_file=_str("LOAD_FILE", "/data/host-load.json"),
+        load_util=int(_str("LOAD_UTIL", "90")),
+        load_alert_sec=int(_str("LOAD_ALERT_SEC", "120")),
+        load_throttle_min=int(_str("LOAD_THROTTLE_MIN", "15")),
+        load_cooldown_min=int(_str("LOAD_COOLDOWN_MIN", "30")),
+        net_limit_mbit=int(_str("NET_LIMIT_MBIT", "300")),
+        ai_user_day=int(_str("AI_USER_DAY", "10") or 0),
+        ai_total_day=int(_str("AI_TOTAL_DAY", "50") or 0),
+        ai_month_rub=float(_str("AI_MONTH_RUB", "0") or 0),
+        ai_prices=tuple((n, float(_str(f"AI_PRICE_{n.upper()}").replace(",", "."))) for n in ("yandex", "groq", "gemini")
+                        if _str(f"AI_PRICE_{n.upper()}")),
     )

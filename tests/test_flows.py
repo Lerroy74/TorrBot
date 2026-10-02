@@ -100,6 +100,8 @@ def env(tmp_path, monkeypatch):
     st = main.State(cfg, DB(str(tmp_path / "db.sqlite3")), FakeTr(), None)
     st.db.allow(ALICE, "Алиса")
     st.db.allow(BOB, "Боб")
+    for _u in (ALICE, BOB):        # были в боте до v8 — могут качать
+        st.db.set_flag(_u, "can_dl", True)
     session = FakeSession()
     bot = Bot("123:abc", session=session)
     dp = Dispatcher()

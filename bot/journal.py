@@ -150,10 +150,16 @@ async def mark_on_pc(st, paths: list[str], auto: bool = True) -> tuple[int, str]
     return n, f"✅ Отметил в Kodi как просмотренное ({files}). {tail}"
 
 
+def home(st, uid: int) -> bool:
+    """v8: скачанное на домашний сервер видят те, кто может качать."""
+    return st.hooks.get("may_download", lambda _: True)(uid)
+
+
 def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMarkup]:
     mode = mode if mode in MODES else "d"
-    rows = st.db.journal(mode, uid)
-    everything = st.db.journal("d", uid) if mode != "d" else rows
+    hm = home(st, uid)
+    rows = st.db.journal(mode, uid, hm)
+    everything = st.db.journal("d", uid, hm) if mode != "d" else rows
     rated = sum(1 for r in everything if r["cnt"])
     todo = sum(1 for r in everything if not r["answered"])
     head = f"📒 <b>Что смотрели</b> · всего {len(everything)}"
@@ -162,7 +168,8 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
     tabs = [B(text=("• " if m == mode else "") + (f"{t} ({todo})" if m == "u" else t),
               callback_data=f"jr:{m}:0") for m, t in MODES.items()]
     if not everything:
-        return head + "\n\nПока пусто: сюда попадает всё, что докачалось через бота.", kb([])
+        return head + ("\n\nПока пусто: сюда попадает всё, что докачалось через бота, и то, что ты оценил(а)."
+                       if hm else "\n\nПока пусто: оценивай фильмы кнопкой «⭐ Оценить» в карточке или в списке."), kb([])
     tabs = [tabs[:2], tabs[2:]]
     if not rows:
         return f"{head}\n\nТы оценил(а) всё 👍", kb(tabs)
@@ -174,7 +181,7 @@ def list_view(st, mode: str, page: int, uid: int) -> tuple[str, InlineKeyboardMa
         mine = ""
         if r["answered"]:
             mine = f" · ты: {r['my']}" if r["my"] else " · ты: не смотрел(а)"
-        disk = " · 💾 на диске" if not r["deleted_at"] else ""
+        disk = " · 💾 на диске" if not r["deleted_at"] else (" · 📋" if r["src"] == "list" else "")
         lines.append(f"<b>{i + 1}.</b> {icon(r)} {esc(r['label'][:70])} — {avg_text(r['avg'], r['cnt'])}{mine} · "
                      f"{day(r['deleted_at'] or r['added_at'])}{disk}")
         btns.append(B(text=str(i + 1), callback_data=f"jq:{r['id']}:{mode}:{page}"))
@@ -194,8 +201,11 @@ def card_view(st, row, mode: str, page: int, uid: int, admin: bool) -> tuple[str
     jid = row["id"]
     lines = [f"{icon(row)} <b>{esc(row['label'][:150])}</b>"]
     added = who(st, row["added_by"])
-    lines.append(f"⬇ Скачано {day(row['added_at'])}" + (f" · 👤 {esc(added)}" if added else ""))
-    lines.append(f"🗑 Удалено {day(row['deleted_at'])}" if row["deleted_at"] else "💾 Ещё на диске")
+    if row["src"] == "list":
+        lines.append("📋 Оценено из списков (через бота не скачивалось)")
+    else:
+        lines.append(f"⬇ Скачано {day(row['added_at'])}" + (f" · 👤 {esc(added)}" if added else ""))
+        lines.append(f"🗑 Удалено {day(row['deleted_at'])}" if row["deleted_at"] else "💾 Ещё на диске")
     avg, cnt = st.db.rating_summary(jid)
     others = others_text(st, jid)
     lines.append(f"\n{avg_text(avg, cnt)}" + (f" — {others}" if others else ""))
@@ -299,6 +309,8 @@ def build_router(st) -> Router:
             await cb.answer("Твоя оценка сброшена")
             return await answered(cb, row, None, tail)
         st.db.rate(jid, uid, n or None)
+        if n and row["tmdb_id"]:                    # v8: оценил — ✅ в его личных списках
+            st.db.watched_personal(uid, row["tmdb_kind"], row["tmdb_id"])
         log.info("оценка %s: %s → %s", uid, row["label"], n or "не смотрел")
         await cb.answer(f"⭐ {n}/10" if n else "Ок, не смотрел(а)")
         await answered(cb, row, n or None, tail)

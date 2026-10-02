@@ -28,6 +28,7 @@ class Info:
     rating: float
     poster: str | None
     cast: list[str] = field(default_factory=list)     # главные актёры (заполняется отдельно)
+    genres: list[int] = field(default_factory=list)   # id жанров TMDB (для детского режима)
 
     def caption(self, max_overview: int = 600) -> str:
         """Подпись к обложке (HTML, укладывается в лимит Telegram 1024 символа)."""
@@ -81,6 +82,8 @@ def _to_info(c: dict) -> Info:
         overview=c.get("overview") or "",
         rating=float(c.get("vote_average") or 0),
         poster=f"{IMG}{c['poster_path']}" if c.get("poster_path") else None,
+        genres=[int(g) for g in (c.get("genre_ids") or [])] or
+               [int(g["id"]) for g in (c.get("genres") or []) if isinstance(g, dict) and g.get("id")],
     )
 
 
@@ -371,6 +374,19 @@ async def discover(http: aiohttp.ClientSession, key: str, kind: str, params: dic
     return out, int(data.get("total_pages") or 1)
 
 
+async def recommendations(http: aiohttp.ClientSession, key: str, kind: str, tid: int,
+                          lang: str = "ru-RU") -> list[Info]:
+    """v8: «похожие» по версии TMDB для фильма/сериала (kind — m|t). Без обложки — не нужны."""
+    media = "tv" if kind == "t" else "movie"
+    data = await _get(http, key, f"/{media}/{tid}/recommendations", {"language": lang, "page": "1"})
+    out = []
+    for c in data.get("results") or []:
+        c["media_type"] = c.get("media_type") or media
+        if c.get("poster_path") and c["media_type"] in ("movie", "tv"):
+            out.append(_to_info(c))
+    return out
+
+
 async def extras(http: aiohttp.ClientSession, key: str, info: Info, lang: str = "ru-RU") -> dict:
     """Трейлер (YouTube) и коллекция («все части») для карточки фильма/сериала.
     {"trailer": url|None, "collection": (id, name)|None}"""
@@ -397,3 +413,49 @@ async def collection(http: aiohttp.ClientSession, key: str, cid: int, lang: str 
             parts.append(c)
     parts.sort(key=lambda c: c["release_date"])
     return data.get("name") or "", [_to_info(c) for c in parts]
+
+
+# ---------- v7: детский режим ----------
+KIDS_GENRES = {16, 10751, 10762}          # мультфильм, семейный, детский (у сериалов)
+
+
+def kid_ok(info: Info) -> bool:
+    """Подходит для детского режима по жанрам (мультфильм / семейное / детское)."""
+    return bool(set(info.genres) & KIDS_GENRES)
+
+
+_RE_AGE = re.compile(r"(\d{1,2})")
+_US_AGE = {"G": 0, "PG": 8, "PG-13": 13, "R": 17, "NC-17": 18, "TV-Y": 0, "TV-Y7": 7, "TV-G": 0,
+           "TV-PG": 8, "TV-14": 14, "TV-MA": 17}
+
+
+def age_from(certs: dict[str, str]) -> int | None:
+    """Возраст из рейтингов по странам: сначала RU («12+»), потом US (PG-13 → 13)."""
+    ru = certs.get("RU") or ""
+    m = _RE_AGE.search(ru)
+    if m:
+        return int(m.group(1))
+    us = (certs.get("US") or "").upper()
+    return _US_AGE.get(us)
+
+
+async def age_rating(http: aiohttp.ClientSession, key: str, info: Info) -> int | None:
+    """Возрастной рейтинг (RU, иначе US); неизвестно — None."""
+    if info.is_tv:
+        data = await _get(http, key, f"/tv/{info.tmdb_id}/content_ratings", {})
+        certs = {r.get("iso_3166_1"): r.get("rating") or "" for r in data.get("results") or []}
+    else:
+        data = await _get(http, key, f"/movie/{info.tmdb_id}/release_dates", {})
+        certs = {}
+        for r in data.get("results") or []:
+            for d in r.get("release_dates") or []:
+                if d.get("certification"):
+                    certs.setdefault(r.get("iso_3166_1"), d["certification"])
+    return age_from(certs)
+
+
+# ---------- v7: состояние сериала (для подписки) ----------
+async def tv_state(http: aiohttp.ClientSession, key: str, tid: int, lang: str = "ru-RU") -> dict:
+    """status (Returning Series / Ended / Canceled), last_episode_to_air, next_episode_to_air,
+    number_of_seasons — как отдаёт TMDB."""
+    return await _get(http, key, f"/tv/{tid}", {"language": lang})
