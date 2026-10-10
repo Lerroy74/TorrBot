@@ -3,6 +3,11 @@ import os
 from dataclasses import dataclass
 
 
+# jac.red с 2026-10 отвечает 403 на запросы без браузерного User-Agent
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/129.0 Safari/537.36")
+
+
 def _str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -29,6 +34,7 @@ class Config:
 
     jacred_url: str
     jacred_proxy: str | None
+    jacred_ua: str
 
     tmdb_key: str | None
     tmdb_lang: str
@@ -138,6 +144,7 @@ def load() -> Config:
         tg_proxy=_str("TG_PROXY") or None,
         jacred_url=_str("JACRED_URL", "https://jac.red").rstrip("/"),
         jacred_proxy=_str("JACRED_PROXY") or None,
+        jacred_ua=_str("JACRED_UA") or DEFAULT_UA,
         tmdb_key=_str("TMDB_API_KEY") or None,
         tmdb_lang=_str("TMDB_LANG", "ru-RU"),
         tmdb_proxy=_str("TMDB_PROXY") or None,

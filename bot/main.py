@@ -1602,7 +1602,7 @@ async def run() -> None:
     if cfg.jacred_proxy:
         from aiohttp_socks import ProxyConnector
         connector = ProxyConnector.from_url(cfg.jacred_proxy, rdns=True)
-    jac_http = aiohttp.ClientSession(connector=connector)
+    jac_http = aiohttp.ClientSession(connector=connector, headers={"User-Agent": cfg.jacred_ua})
     tr_http = aiohttp.ClientSession()
     tr = Transmission(tr_http, cfg.tr_url, cfg.tr_user, cfg.tr_pass)
     tmdb_http = None
