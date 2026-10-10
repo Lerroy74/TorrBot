@@ -112,6 +112,7 @@ class Config:
     day_hours: str = "08:00-23:00"     # дневной режим: когда притормаживать
     load_file: str = "/data/host-load.json"   # что пишет агент нагрузки на сервере
     load_util: int = 90                # диск занят на столько % и больше — перегрузка
+    load_await_ms: float = 30.0       # …и отклик диска не меньше стольких мс (0 — не учитывать)
     load_alert_sec: int = 120          # …столько секунд подряд
     load_throttle_min: int = 15        # притормозили из-за перегрузки — не меньше N минут
     load_cooldown_min: int = 30        # повтор тревоги о перегрузке не чаще
@@ -213,6 +214,7 @@ def load() -> Config:
         day_hours=_str("DAY_HOURS", "08:00-23:00"),
         load_file=_str("LOAD_FILE", "/data/host-load.json"),
         load_util=int(_str("LOAD_UTIL", "90")),
+        load_await_ms=float(_str("LOAD_AWAIT_MS") or "30"),
         load_alert_sec=int(_str("LOAD_ALERT_SEC", "120")),
         load_throttle_min=int(_str("LOAD_THROTTLE_MIN", "15")),
         load_cooldown_min=int(_str("LOAD_COOLDOWN_MIN", "30")),

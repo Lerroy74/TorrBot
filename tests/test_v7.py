@@ -636,6 +636,8 @@ async def test_guard_throttles_and_alerts(env):
         await guard.guard_once(bot, st, t0 + 400 + i, night)
     alert = [t for t in texts(session, ADMIN) if "захлёбывается" in t]
     assert len(alert) == 1 and "Притормозил" in alert[0] and st.tr.turtles[-1][0] is True
+    silent = [m for m in session.calls if "захлёбывается" in (getattr(m, "text", None) or "")]
+    assert silent and all(m.disable_notification for m in silent)       # тревога без звука
     # SMART ухудшился
     write(t0 + 600, 20, smart={"health": "PASSED", "realloc": 8, "pending": 0, "uncorrect": 0})
     await guard.guard_once(bot, st, t0 + 600, night)
@@ -649,6 +651,19 @@ async def test_guard_throttles_and_alerts(env):
     assert st.tr.turtles[-1][0] is True and "дневной" in st.guard.reasons[0]
     await guard.guard_once(bot, st, t0 + 715, datetime(2026, 1, 1, 23, 30))
     assert st.tr.turtles[-1][0] is False
+
+
+async def test_guard_ignores_busy_disk_with_fast_response(env):
+    """Раздачи: HDD занят ~100%, но отклик 10 мс — не тревога и не «черепаха»."""
+    st, session, send, press, mp, bot, tmp = env
+    t0, night = time.time(), datetime(2026, 1, 1, 2, 0)
+    for i in range(0, 200, 15):
+        with open(st.cfg.load_file, "w") as f:
+            json.dump({"ts": t0 + i, "disk": {"dev": "sdb", "util": 98, "write_mb": 0, "read_mb": 3, "await_ms": 10},
+                       "net": {"rx_mbit": 1, "tx_mbit": 16}}, f)
+        await guard.guard_once(bot, st, t0 + i, night)
+    assert not [t for t in texts(session, ADMIN) if "захлёбывается" in t]
+    assert not st.guard.reasons
 
 
 async def test_guard_agent_silence_and_speed_menu(env):

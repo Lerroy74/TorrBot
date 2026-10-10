@@ -4,7 +4,8 @@
 (host/load-agent.py, вне Docker — из контейнера этого не видно) и каждые 5 секунд пишет
 в data/host-load.json. Бот читает файл раз в 15 секунд и:
 
-* предупреждает админа: диск захлёбывается (занят ≥ LOAD_UTIL% дольше LOAD_ALERT_SEC),
+* предупреждает админа (без звука): диск захлёбывается (занят ≥ LOAD_UTIL% при отклике ≥ LOAD_AWAIT_MS
+  дольше LOAD_ALERT_SEC),
   канал забит (≥ 90% NET_LIMIT_MBIT), SMART диска ухудшился, агент перестал отвечать —
   с объяснением, кто нагружает (закачки, просмотр на ТВ, просмотр по сети);
 * включает «черепаху» в Transmission (TURTLE_DOWN_MB / TURTLE_UP_MB), когда:
@@ -143,7 +144,10 @@ async def guard_once(bot: Bot, st, now: float | None = None, local: datetime | N
     disk = (data or {}).get("disk") or {}
     net = (data or {}).get("net") or {}
     if data is not None:
-        g.utils.append((now, float(disk.get("util") or 0)))
+        # занятость считаем только при медленном отклике: у HDD при случайном чтении (раздачи)
+        # util почти всегда под 100%, а это не мешает, пока отклик в норме (LOAD_AWAIT_MS, 0 — не учитывать)
+        slow = float(disk.get("await_ms") or 0) >= cfg.load_await_ms
+        g.utils.append((now, float(disk.get("util") or 0) if slow else 0.0))
         g.nets.append((now, max(float(net.get("rx_mbit") or 0), float(net.get("tx_mbit") or 0))))
 
     # --- кто смотрит ---
@@ -176,7 +180,7 @@ async def guard_once(bot: Bot, st, now: float | None = None, local: datetime | N
     cool = cfg.load_cooldown_min * 60
     if overloaded and now - g.alerted.get("disk", 0) >= cool:
         g.alerted["disk"] = now
-        await notify_admins(bot, st, await overload_text(st, data, sets))
+        await notify_admins(bot, st, await overload_text(st, data, sets), disable_notification=True)
     limit = cfg.net_limit_mbit * 0.9
     if cfg.net_limit_mbit and sustained(g.nets, now, cfg.load_alert_sec, limit) and \
             now - g.alerted.get("net", 0) >= cool:
@@ -184,7 +188,8 @@ async def guard_once(bot: Bot, st, now: float | None = None, local: datetime | N
         tr = await tr_line(st)
         await notify_admins(bot, st, f"🌐 Канал забит: ⬇ {net.get('rx_mbit', 0):.0f} / ⬆ {net.get('tx_mbit', 0):.0f} "
                                      f"Мбит/с при тарифе {cfg.net_limit_mbit} уже {cfg.load_alert_sec // 60} мин.\n"
-                                     f"{tr}\nVPN у пользователей и просмотр могут тормозить.")
+                                     f"{tr}\nVPN у пользователей и просмотр могут тормозить.",
+                            disable_notification=True)
     await smart_check(bot, st, (data or {}).get("smart"), now)
 
 
@@ -210,16 +215,21 @@ async def overload_text(st, data: dict | None, sets: dict) -> str:
     cfg, g = st.cfg, st.guard
     d = (data or {}).get("disk") or {}
     s = await tr_stats(st)
-    busy_tr = bool(s) and (s.get("downloadSpeed") or 0) + (s.get("uploadSpeed") or 0) > 512 * 1024
+    down, up = ((s.get("downloadSpeed") or 0), (s.get("uploadSpeed") or 0)) if s else (0, 0)
+    busy_tr = down + up > 512 * 1024
+    seeding_only = busy_tr and down <= 512 * 1024
     lines = [f"💽 <b>Диск захлёбывается</b>: занят {d.get('util', 0):.0f}% уже {cfg.load_alert_sec // 60} мин "
              f"(запись {d.get('write_mb', 0):.1f} МБ/с, чтение {d.get('read_mb', 0):.1f} МБ/с, "
              f"отклик {d.get('await_ms', 0):.0f} мс).", tr_text(s)]
     if g.watching:
         lines.append("Смотрят: " + esc("; ".join(g.watching)))
+    if seeding_only and not g.watching:
+        lines.append("Закачек нет — нагружают раздачи: диск читает куски разных файлов вразнобой.")
     if not g.watching and not busy_tr:
         lines.append("Закачек и просмотра нет — нагружает что-то другое (Kodi сканирует, бэкап, проверка диска).")
     if sets["disk"]:
-        lines.append(f"🐢 Притормозил закачки до {cfg.turtle_down_mb:g} МБ/с минимум на {cfg.load_throttle_min} мин.")
+        lines.append(f"🐢 Притормозил закачки до {cfg.turtle_down_mb:g} МБ/с и раздачи до {cfg.turtle_up_mb:g} МБ/с "
+                     f"минимум на {cfg.load_throttle_min} мин.")
     else:
         lines.append("Автоторможение при перегрузке выключено — /speed.")
     if g.watching and busy_tr:
