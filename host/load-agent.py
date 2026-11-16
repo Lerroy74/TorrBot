@@ -6,7 +6,9 @@
   * сеть (интерфейс маршрута по умолчанию): Мбит/с приём/отдача;
   * iowait процессора;
   * какие фильмы сейчас открыты по сети (Samba) и с какого адреса;
-  * SMART диска (раз в 6 часов; нужен smartmontools).
+  * SMART всех дисков сервера (раз в 6 часов; нужен smartmontools) — в `smart_all`; для диска с
+    медиатекой он же в `smart`. Раз в сутки по строке на диск дописывается в smart-history.jsonl
+    (рядом с host-load.json): так видно, как со временем растут переназначенные секторы и т. п.
 Бот читает файл и решает, тормозить ли закачки и кого предупредить (см. bot/guard.py).
 
 Ручной запуск:  sudo torrbot-load-agent --once     — один замер на экран
@@ -140,10 +142,52 @@ def smart(dev_path: str) -> dict:
     attrs = {a.get("id"): ((a.get("raw") or {}).get("value") or 0)
              for a in (data.get("ata_smart_attributes") or {}).get("table") or []}
     passed = (data.get("smart_status") or {}).get("passed")
+    life = next((v.get("value") for v in (data.get("ata_smart_attributes") or {}).get("table") or []
+                 if v.get("id") in (231, 233, 177) and v.get("value")), None)     # остаток ресурса SSD, %
     return {"health": "PASSED" if passed else ("FAILED" if passed is False else "?"),
             "temp": (data.get("temperature") or {}).get("current"),
             "realloc": attrs.get(5, 0), "pending": attrs.get(197, 0), "uncorrect": attrs.get(198, 0),
-            "checked": int(time.time())}
+            "crc": attrs.get(199, 0), "hours": attrs.get(9) or (data.get("power_on_time") or {}).get("hours"),
+            "model": data.get("model_name"), "life": life, "checked": int(time.time())}
+
+
+def physical_disks() -> list[str]:
+    """Имена настоящих дисков (sda, sdb, nvme0n1), без loop/zram/cdrom."""
+    out = []
+    for line in run(["lsblk", "-dn", "-o", "NAME,TYPE"]).splitlines():
+        p = line.split()
+        if len(p) >= 2 and p[1] == "disk" and not p[0].startswith(("loop", "zram", "ram")):
+            out.append(p[0])
+    return out
+
+
+def history_days(path: str) -> dict[str, str]:
+    """{диск: последний записанный день} — чтобы после перезапуска не дублировать строки."""
+    last: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    last[r["dev"]] = r["day"]
+                except (ValueError, KeyError):
+                    continue
+    except OSError:
+        pass
+    return last
+
+
+def history_add(path: str, last: dict[str, str], dev: str, st: dict) -> None:
+    today = time.strftime("%Y-%m-%d")
+    if st.get("error") or last.get(dev) == today:
+        return
+    keys = ("model", "health", "realloc", "pending", "uncorrect", "crc", "hours", "temp", "life")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"day": today, "dev": dev, **{k: st.get(k) for k in keys}}, ensure_ascii=False) + "\n")
+        last[dev] = today
+    except OSError as e:
+        print(f"не смог дописать {path}: {e}", flush=True)
 
 
 def main() -> None:
@@ -159,6 +203,9 @@ def main() -> None:
     iface = default_iface()
     prev = (time.time(), diskstats(dev) if dev else None, cpu_times(), netbytes(iface) if iface else None)
     smart_state, smart_at = {}, 0.0
+    smart_all: dict[str, dict] = {}
+    hist = os.path.join(os.path.dirname(out), "smart-history.jsonl")
+    hist_last = history_days(hist)
     if a.once:
         time.sleep(a.every)
     while True:
@@ -188,8 +235,14 @@ def main() -> None:
         files = smb_open(media)
         rec["smb"] = {"open": len(files), "items": files}
         if part and now - smart_at >= SMART_EVERY:
-            smart_state, smart_at = smart(part), now
+            smart_at = now
+            smart_state = smart(part)
+            smart_all = {d: smart("/dev/" + d) for d in physical_disks()}
+            if not a.once:
+                for d, state in smart_all.items():
+                    history_add(hist, hist_last, d, state)
         rec["smart"] = smart_state
+        rec["smart_all"] = smart_all
         prev = (now, ds, cpu, nb)
         if a.once:
             print(json.dumps(rec, ensure_ascii=False, indent=1))

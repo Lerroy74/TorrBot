@@ -190,7 +190,7 @@ async def guard_once(bot: Bot, st, now: float | None = None, local: datetime | N
                                      f"Мбит/с при тарифе {cfg.net_limit_mbit} уже {cfg.load_alert_sec // 60} мин.\n"
                                      f"{tr}\nVPN у пользователей и просмотр могут тормозить.",
                             disable_notification=True)
-    await smart_check(bot, st, (data or {}).get("smart"), now)
+    await smart_check(bot, st, data, now)
 
 
 async def tr_stats(st) -> dict | None:
@@ -237,29 +237,71 @@ async def overload_text(st, data: dict | None, sets: dict) -> str:
     return "\n".join(lines)
 
 
-async def smart_check(bot: Bot, st, smart: dict | None, now: float) -> None:
+async def smart_check(bot: Bot, st, data: dict | None, now: float) -> None:
+    """SMART всех дисков (агент v8.4: smart_all; старый агент — только smart диска с медиатекой)."""
     from .extras import notify_admins
-    if not smart or smart.get("error"):
-        return
+    data = data or {}
+    disks = data.get("smart_all") or ({"": data["smart"]} if data.get("smart") else {})
     g = st.guard
-    prev = g.smart_last
+    if not g.smart_last:                                     # после перезапуска бота не повторять старое
+        try:
+            g.smart_last = json.loads(st.db.pref(0, "smart_last") or "{}")
+        except ValueError:
+            g.smart_last = {}
     msgs = []
-    if smart.get("health") and smart.get("health") != "PASSED" and prev.get("health") != smart.get("health"):
-        msgs.append(f"‼ SMART диска: <b>{esc(str(smart['health']))}</b> — диск может скоро отказать, сделай копию важного.")
-    for k, name in (("realloc", "переназначенных секторов"), ("pending", "нестабильных секторов"),
-                    ("uncorrect", "неисправимых ошибок")):
-        v, pv = int(smart.get(k) or 0), prev.get(k)
-        if pv is not None and v > int(pv):
-            msgs.append(f"⚠ SMART: стало больше {name}: {pv} → {v}. Диск начинает сыпаться.")
-        elif pv is None and v > 0 and not prev:
-            msgs.append(f"⚠ SMART: {name} — {v}. Стоит присматривать за диском.")
-    temp = smart.get("temp")
-    if temp and int(temp) >= 55 and now - g.alerted.get("temp", 0) >= 6 * 3600:
-        g.alerted["temp"] = now
-        msgs.append(f"🌡 Диск нагрелся до {temp}°C — проверь охлаждение.")
-    g.smart_last = {k: smart.get(k) for k in ("health", "realloc", "pending", "uncorrect")}
+    for dev, smart in disks.items():
+        if not smart or smart.get("error"):
+            continue
+        who = f"диска {esc(dev)}" + (f" ({esc(str(smart['model']))})" if smart.get("model") else "") if dev else "диска"
+        prev = g.smart_last.get(dev) or {}
+        if smart.get("health") and smart.get("health") != "PASSED" and prev.get("health") != smart.get("health"):
+            msgs.append(f"‼ SMART {who}: <b>{esc(str(smart['health']))}</b> — диск может скоро отказать, "
+                        f"сделай копию важного.")
+        for k, name in (("realloc", "переназначенных секторов"), ("pending", "нестабильных секторов"),
+                        ("uncorrect", "неисправимых ошибок")):
+            v, pv = int(smart.get(k) or 0), prev.get(k)
+            if pv is not None and v > int(pv):
+                msgs.append(f"⚠ SMART {who}: стало больше {name}: {pv} → {v}. Диск начинает сыпаться.")
+            elif pv is None and v > 0 and not prev:
+                msgs.append(f"⚠ SMART {who}: {name} — {v}. Стоит присматривать за диском.")
+        temp = smart.get("temp")
+        if temp and int(temp) >= 55 and now - g.alerted.get(f"temp{dev}", 0) >= 6 * 3600:
+            g.alerted[f"temp{dev}"] = now
+            msgs.append(f"🌡 Диск {esc(dev) or ''} нагрелся до {temp}°C — проверь охлаждение.")
+        g.smart_last[dev] = {k: smart.get(k) for k in ("health", "realloc", "pending", "uncorrect")}
+    if disks:
+        try:
+            st.db.set_pref(0, "smart_last", json.dumps(g.smart_last))
+        except Exception as e:
+            log.info("smart_last: %r", e)
     for m in msgs:
         await notify_admins(bot, st, m)
+
+
+def smart_trend(st, dev: str, days: int = 30) -> str:
+    """«за 30 дн.: переназн. +2, нестаб. +5» по smart-history.jsonl (пусто, если истории мало)."""
+    path = os.path.join(os.path.dirname(st.cfg.load_file), "smart-history.jsonl")
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("dev") == dev:
+                    rows.append(r)
+    except OSError:
+        return ""
+    if len(rows) < 2:
+        return ""
+    cut = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    base = next((r for r in rows if r["day"] >= cut), rows[0])
+    last = rows[-1]
+    span = max(1, (datetime.strptime(last["day"], "%Y-%m-%d") - datetime.strptime(base["day"], "%Y-%m-%d")).days)
+    diff = [f"{n} {int(last.get(k) or 0) - int(base.get(k) or 0):+d}"
+            for k, n in (("realloc", "переназн."), ("pending", "нестаб."), ("uncorrect", "неиспр.")) if last.get(k) is not None]
+    return f"за {span} дн.: " + ", ".join(diff)
 
 
 def summary(st) -> list[str]:
@@ -274,14 +316,25 @@ def summary(st) -> list[str]:
            f"занят {d.get('util', 0):.0f}%, запись {d.get('write_mb', 0):.1f} МБ/с, "
            f"чтение {d.get('read_mb', 0):.1f} МБ/с, отклик {d.get('await_ms', 0):.0f} мс",
            f"✅ 🌐 Сеть: ⬇ {n.get('rx_mbit', 0):.0f} / ⬆ {n.get('tx_mbit', 0):.0f} Мбит/с"]
-    sm = data.get("smart") or {}
-    if sm.get("health"):
-        ok = sm.get("health") == "PASSED" and not any(int(sm.get(k) or 0) for k in ("realloc", "pending", "uncorrect"))
-        out.append(f"{'✅' if ok else '⚠'} 🩺 SMART: {esc(str(sm['health']))}"
-                   + (f", {sm['temp']}°C" if sm.get("temp") else "")
-                   + (f", переназн. {sm.get('realloc', 0)}, нестаб. {sm.get('pending', 0)}" if not ok else ""))
-    elif sm.get("error"):
-        out.append(f"❔ 🩺 SMART: {esc(str(sm['error'])[:80])}")
+    disks = data.get("smart_all") or ({"": data["smart"]} if data.get("smart") else {})
+    for dev, sm in disks.items():
+        title = f"🩺 SMART {esc(dev)}".rstrip() + (f" ({esc(str(sm['model']))})" if sm.get("model") else "")
+        if sm.get("health"):
+            ok = sm.get("health") == "PASSED" and not any(int(sm.get(k) or 0) for k in ("realloc", "pending", "uncorrect"))
+            tail = ""
+            if sm.get("temp"):
+                tail += f", {sm['temp']}°C"
+            if sm.get("hours"):
+                tail += f", {int(sm['hours']) // 24} дн. работы"
+            if not ok:
+                tail += (f", переназн. {sm.get('realloc', 0)}, нестаб. {sm.get('pending', 0)}, "
+                         f"неиспр. {sm.get('uncorrect', 0)}")
+                trend = smart_trend(st, dev)
+                if trend:
+                    tail += f" ({trend})"
+            out.append(f"{'✅' if ok else '⚠'} {title}: {esc(str(sm['health']))}{tail}")
+        elif sm.get("error"):
+            out.append(f"❔ {title}: {esc(str(sm['error'])[:80])}")
     if g.watching:
         out.append("👀 Смотрят: " + esc("; ".join(g.watching)))
     return out

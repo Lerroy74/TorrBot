@@ -713,3 +713,52 @@ async def test_kodi_jobs_wait_while_busy():
     assert await remote.kodi_sync_once(st, now + 80) == []                     # чистит — обновление ждёт
     st.kodi.scanning = False
     assert await remote.kodi_sync_once(st, now + 120) == ["scan"] and calls == ["clean", "scan"]
+
+
+async def test_smart_all_disks_alerts_and_trend(env):
+    """v8.4.1: SMART следит за всеми дисками; тревога по каждому отдельно и не повторяется после перезапуска."""
+    st, session, send, press, mp, bot, tmp = env
+    t0 = time.time()
+    sda = {"health": "PASSED", "model": "SSD X", "realloc": 5, "pending": 5, "uncorrect": 2, "hours": 14439}
+    sdb = {"health": "PASSED", "model": "HDD Y", "realloc": 0, "pending": 0, "uncorrect": 0}
+    data = {"ts": t0, "smart_all": {"sda": sda, "sdb": sdb}}
+    await guard.smart_check(bot, st, data, t0)
+    msgs = [t for t in texts(session, ADMIN) if "SMART" in t]
+    assert len(msgs) == 3 and all("sda" in m and "SSD X" in m for m in msgs)       # 3 счётчика sda, sdb чист
+    n = len(texts(session, ADMIN))
+    st.guard.smart_last = {}                                                       # «перезапуск бота»
+    await guard.smart_check(bot, st, data, t0 + 60)
+    assert len(texts(session, ADMIN)) == n                                         # то же самое — молчим
+    data["smart_all"]["sdb"] = {**sdb, "realloc": 1}
+    await guard.smart_check(bot, st, data, t0 + 120)
+    assert "sdb" in texts(session, ADMIN)[-1] and "0 → 1" in texts(session, ADMIN)[-1]
+    st.guard.last = data
+    lines = "\n".join(guard.summary(st))
+    assert "SMART sda" in lines and "SMART sdb" in lines
+
+
+def test_smart_history_and_trend(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("load_agent", os.path.join(os.path.dirname(__file__), "..", "host", "load-agent.py"))
+    la = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(la)
+    path = str(tmp_path / "smart-history.jsonl")
+    last: dict = {}
+    la.history_add(path, last, "sda", {"health": "PASSED", "realloc": 5})
+    la.history_add(path, last, "sda", {"health": "PASSED", "realloc": 6})            # в тот же день — не дублируем
+    la.history_add(path, last, "sdb", {"error": "нет SMART"})                        # ошибка — не пишем
+    assert len(open(path).read().strip().splitlines()) == 1
+    assert la.history_days(path) == {"sda": time.strftime("%Y-%m-%d")}
+
+
+def test_smart_trend_text(tmp_path):
+    from types import SimpleNamespace
+    path = tmp_path / "host-load.json"
+    hist = tmp_path / "smart-history.jsonl"
+    d1 = time.strftime("%Y-%m-%d", time.localtime(time.time() - 10 * 86400))
+    d2 = time.strftime("%Y-%m-%d")
+    hist.write_text(json.dumps({"day": d1, "dev": "sda", "realloc": 5, "pending": 5, "uncorrect": 2}) + "\n"
+                    + json.dumps({"day": d2, "dev": "sda", "realloc": 8, "pending": 5, "uncorrect": 2}) + "\n")
+    st = SimpleNamespace(cfg=SimpleNamespace(load_file=str(path)))
+    assert guard.smart_trend(st, "sda") == "за 10 дн.: переназн. +3, нестаб. +0, неиспр. +0"
+    assert guard.smart_trend(st, "sdb") == ""
