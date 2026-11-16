@@ -719,12 +719,12 @@ async def test_smart_all_disks_alerts_and_trend(env):
     """v8.4.1: SMART следит за всеми дисками; тревога по каждому отдельно и не повторяется после перезапуска."""
     st, session, send, press, mp, bot, tmp = env
     t0 = time.time()
-    sda = {"health": "PASSED", "model": "SSD X", "realloc": 5, "pending": 5, "uncorrect": 2, "hours": 14439}
+    sda = {"health": "PASSED", "model": "SSD X", "label": "системный, SSD 111.8G, SSD X, S/N 123", "realloc": 5, "pending": 5, "uncorrect": 2, "hours": 14439}
     sdb = {"health": "PASSED", "model": "HDD Y", "realloc": 0, "pending": 0, "uncorrect": 0}
     data = {"ts": t0, "smart_all": {"sda": sda, "sdb": sdb}}
     await guard.smart_check(bot, st, data, t0)
     msgs = [t for t in texts(session, ADMIN) if "SMART" in t]
-    assert len(msgs) == 3 and all("sda" in m and "SSD X" in m for m in msgs)       # 3 счётчика sda, sdb чист
+    assert len(msgs) == 3 and all("sda" in m and "системный" in m and "S/N 123" in m for m in msgs)       # 3 счётчика sda, sdb чист
     n = len(texts(session, ADMIN))
     st.guard.smart_last = {}                                                       # «перезапуск бота»
     await guard.smart_check(bot, st, data, t0 + 60)
@@ -762,3 +762,21 @@ def test_smart_trend_text(tmp_path):
     st = SimpleNamespace(cfg=SimpleNamespace(load_file=str(path)))
     assert guard.smart_trend(st, "sda") == "за 10 дн.: переназн. +3, нестаб. +0, неиспр. +0"
     assert guard.smart_trend(st, "sdb") == ""
+
+
+def test_disk_label_from_lsblk(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("la2", os.path.join(os.path.dirname(__file__), "..", "host", "load-agent.py"))
+    la = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(la)
+    out = {("lsblk", "-nr", "-o", "MOUNTPOINT", "/dev/sda"): "/boot/efi\n/boot\n/\n",
+           ("lsblk", "-nr", "-o", "MOUNTPOINT", "/dev/sdb"): "/mnt/media\n",
+           ("lsblk", "-nr", "-o", "MOUNTPOINT", "/dev/sdc"): "\n",
+           ("lsblk", "-dn", "-o", "ROTA,SIZE,MODEL,SERIAL", "/dev/sda"): "0 111,8G Samsung SSD 850 S123\n",
+           ("lsblk", "-dn", "-o", "ROTA,SIZE,MODEL,SERIAL", "/dev/sdb"): "1 698,7G WDC WD7500 WD-ABC\n",
+           ("lsblk", "-dn", "-o", "ROTA,SIZE,MODEL,SERIAL", "/dev/sdc"): "1 1T\n"}
+    monkeypatch.setattr(la, "run", lambda cmd, timeout=10: out.get(tuple(cmd), ""))
+    a = la.disk_label("sda", "/mnt/media", {"model_name": "Samsung SSD 850", "serial_number": "S123"})
+    assert a == "системный, SSD 111.8G, Samsung SSD 850, S/N S123"
+    assert la.disk_label("sdb", "/mnt/media/", {}).startswith("медиатека, HDD 698.7G")
+    assert la.disk_label("sdc", "/mnt/media").startswith("без точки монтирования, HDD 1T")

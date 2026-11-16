@@ -148,7 +148,8 @@ def smart(dev_path: str) -> dict:
             "temp": (data.get("temperature") or {}).get("current"),
             "realloc": attrs.get(5, 0), "pending": attrs.get(197, 0), "uncorrect": attrs.get(198, 0),
             "crc": attrs.get(199, 0), "hours": attrs.get(9) or (data.get("power_on_time") or {}).get("hours"),
-            "model": data.get("model_name"), "life": life, "checked": int(time.time())}
+            "model": data.get("model_name"), "life": life, "checked": int(time.time()),
+            "_raw": {"model_name": data.get("model_name"), "serial_number": data.get("serial_number")}}
 
 
 def physical_disks() -> list[str]:
@@ -159,6 +160,33 @@ def physical_disks() -> list[str]:
         if len(p) >= 2 and p[1] == "disk" and not p[0].startswith(("loop", "zram", "ram")):
             out.append(p[0])
     return out
+
+
+def disk_label(dev: str, media: str, smart_data: dict | None = None) -> str:
+    """Как опознать диск человеку: «системный SSD 112 ГБ, SSD X, S/N 123» / «медиатека HDD 699 ГБ, …»."""
+    mounts = [m for m in run(["lsblk", "-nr", "-o", "MOUNTPOINT", "/dev/" + dev]).split() if m.startswith("/")]
+    media = media.rstrip("/") or "/mnt/media"
+    if "/" in mounts:
+        role = "системный"
+    elif any(m == media or m.startswith(media + "/") for m in mounts):
+        role = "медиатека"
+    else:
+        role = "примонтирован: " + ", ".join(sorted(set(mounts))[:2]) if mounts else "без точки монтирования"
+    info = run(["lsblk", "-dn", "-o", "ROTA,SIZE,MODEL,SERIAL", "/dev/" + dev]).split(None, 3)
+    kind, size, rest = "", "", ""
+    if len(info) >= 2:
+        kind = "HDD" if info[0] == "1" else "SSD"
+        size = info[1].replace(",", ".")
+        rest = info[3].strip() if len(info) > 3 else ""
+    d = smart_data or {}
+    model = d.get("model_name") or (rest.rsplit(" ", 1)[0] if " " in rest else rest)
+    serial = d.get("serial_number") or (rest.rsplit(" ", 1)[1] if " " in rest else "")
+    parts = [f"{role}, {kind} {size}".replace("  ", " ").strip(", ")]
+    if model:
+        parts.append(str(model).strip())
+    if serial:
+        parts.append(f"S/N {str(serial).strip()}")
+    return ", ".join(parts)
 
 
 def history_days(path: str) -> dict[str, str]:
@@ -237,7 +265,11 @@ def main() -> None:
         if part and now - smart_at >= SMART_EVERY:
             smart_at = now
             smart_state = smart(part)
-            smart_all = {d: smart("/dev/" + d) for d in physical_disks()}
+            smart_state.pop("_raw", None)
+            smart_all = {}
+            for d in physical_disks():
+                smart_all[d] = smart("/dev/" + d)
+                smart_all[d]["label"] = disk_label(d, media, smart_all[d].pop("_raw", None))
             if not a.once:
                 for d, state in smart_all.items():
                     history_add(hist, hist_last, d, state)

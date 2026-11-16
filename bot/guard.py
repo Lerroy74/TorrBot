@@ -252,7 +252,7 @@ async def smart_check(bot: Bot, st, data: dict | None, now: float) -> None:
     for dev, smart in disks.items():
         if not smart or smart.get("error"):
             continue
-        who = f"диска {esc(dev)}" + (f" ({esc(str(smart['model']))})" if smart.get("model") else "") if dev else "диска"
+        who = disk_name(dev, smart)
         prev = g.smart_last.get(dev) or {}
         if smart.get("health") and smart.get("health") != "PASSED" and prev.get("health") != smart.get("health"):
             msgs.append(f"‼ SMART {who}: <b>{esc(str(smart['health']))}</b> — диск может скоро отказать, "
@@ -276,6 +276,14 @@ async def smart_check(bot: Bot, st, data: dict | None, now: float) -> None:
             log.info("smart_last: %r", e)
     for m in msgs:
         await notify_admins(bot, st, m)
+
+
+def disk_name(dev: str, smart: dict) -> str:
+    """«диска sda (системный, SSD 112G, модель, S/N …)» — чтобы сразу было понятно, о каком диске речь."""
+    if not dev:
+        return "диска"
+    label = smart.get("label") or (str(smart["model"]) if smart.get("model") else "")
+    return f"диска {esc(dev)}" + (f" ({esc(label)})" if label else "")
 
 
 def smart_trend(st, dev: str, days: int = 30) -> str:
@@ -318,7 +326,7 @@ def summary(st) -> list[str]:
            f"✅ 🌐 Сеть: ⬇ {n.get('rx_mbit', 0):.0f} / ⬆ {n.get('tx_mbit', 0):.0f} Мбит/с"]
     disks = data.get("smart_all") or ({"": data["smart"]} if data.get("smart") else {})
     for dev, sm in disks.items():
-        title = f"🩺 SMART {esc(dev)}".rstrip() + (f" ({esc(str(sm['model']))})" if sm.get("model") else "")
+        title = "🩺 SMART " + disk_name(dev, sm).replace("диска ", "", 1).replace("диска", "").strip()
         if sm.get("health"):
             ok = sm.get("health") == "PASSED" and not any(int(sm.get(k) or 0) for k in ("realloc", "pending", "uncorrect"))
             tail = ""
