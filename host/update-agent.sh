@@ -123,5 +123,25 @@ elif [ "$PUSH" = 1 ]; then
   GIT="
 GitHub: ~/torrbot не git-репозиторий — не пушу."
 fi
-result ok "✅ Обновлено: v$OLD → v$NEW, бот работает.$GIT
+# v8.4.3: программы сервера (сторож, агент нагрузки, этот агент) обновляем сами, если в архиве они изменились.
+# Запуск install.sh — отдельной задачей через минуту: он заменяет и этого агента, а мы к тому времени уже закончим.
+HOSTUP=""
+if [ -f "$APP/host/install.sh" ]; then
+  chg=0
+  for pair in host-watch.sh:torrbot-host-watch load-agent.py:torrbot-load-agent update-agent.sh:torrbot-update-agent; do
+    src=${pair%%:*}; dst=/usr/local/bin/${pair#*:}
+    cmp -s "$APP/host/$src" "$dst" 2>/dev/null || chg=1
+  done
+  if [ "$chg" = 1 ]; then
+    if systemd-run --quiet --on-active=60 --unit="torrbot-host-install-$(date +%s)" \
+         env WATCH_ENV="$ENV_FILE" sh "$APP/host/install.sh" >> "$LOG" 2>&1; then
+      HOSTUP="
+🔧 Программы сервера изменились — обновлю их сам через минуту (журнал: journalctl -u 'torrbot-host-install-*')."
+    else
+      HOSTUP="
+⚠ Программы сервера изменились, а обновить сами не смог — выполни: sudo sh ~/torrbot/host/install.sh"
+    fi
+  fi
+fi
+result ok "✅ Обновлено: v$OLD → v$NEW, бот работает.$GIT$HOSTUP
 Откат, если что: sh ~/torrbot/rollback.sh"
