@@ -1,7 +1,7 @@
 #!/bin/sh
 # Установка программ сервера, которые работают вне Docker (один раз, и после обновления бота):
 #   sudo sh ~/torrbot/host/install.sh
-# 1. Сторож сервера (host-watch.sh): туннель и контейнер бота, раз в 3 минуты, пишет в Telegram напрямую.
+# 1. Сторож сервера (host-watch.sh): туннель и контейнер бота, раз в 3 минуты; называет причину обрыва.
 # 2. Агент нагрузки (load-agent.py, v7): диск, сеть, просмотр по сети, SMART — каждые 5 секунд
 #    в ~/torrbot/data/host-load.json; по этим данным бот тормозит закачки и предупреждает админа.
 # 3. Программа обновления (update-agent.sh, v8.2): ставит архив, присланный боту в Telegram,
@@ -18,7 +18,7 @@ ENV_FILE=${WATCH_ENV:-$APP/.env}
 install -m 755 "$DIR/host-watch.sh" /usr/local/bin/torrbot-host-watch
 cat > /etc/systemd/system/torrbot-host-watch.service <<UNIT
 [Unit]
-Description=torrbot: сторож сервера (туннель, бот) с оповещением в Telegram напрямую
+Description=torrbot: сторож сервера (туннель, бот) с оповещением в Telegram
 After=network-online.target docker.service
 Wants=network-online.target
 

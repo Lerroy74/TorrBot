@@ -245,3 +245,36 @@ async def test_rating_after_watching_on_tv(tmp_path, monkeypatch):
     assert await main.rating_watch_once(bot, st) == 1
     assert "Как вам" in bot.msgs[-1][0] and "Новый (2024)" in bot.msgs[-1][0]
     assert await main.rating_watch_once(bot, st) == 0                      # второй раз не спрашиваем
+
+
+async def test_cleanup_two_days_warns_a_day_ahead(tmp_path, monkeypatch):
+    """v8.3.3: срок 2 дня, предупреждение за 24 ч — предупреждаем через сутки после просмотра,
+    удаляем через двое (а не через трое, как было бы при отсчёте предупреждения от срока)."""
+    monkeypatch.setenv("CLEANUP_DAYS", "2")
+    monkeypatch.setenv("CLEANUP_WARN_HOURS", "24")
+    cfg = load()
+    db = DB(str(tmp_path / "db.sqlite3"))
+    ago = lambda h: (datetime.now() - timedelta(hours=h)).strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
+    tr = FakeTr([{"hashString": h, "name": f"{h}.mkv", "downloadDir": "/downloads/movies", "totalSize": 5}
+                 for h in "abc"])
+    kd = FakeKodi([ep("/movies/a.mkv", 1, ago(12)), ep("/movies/b.mkv", 1, ago(30)), ep("/movies/c.mkv", 1, ago(50))])
+    for h in "abc":
+        db.add_download(h, h, h, "movies", 1, 1)
+        db.mark_done(h)
+    st = main.State(cfg, db, tr, None)
+    st.kodi = kd
+    bot = FakeBot()
+
+    await main.cleanup_once(bot, st)
+    warned = [m[0] for m in bot.msgs]
+    assert len(warned) == 2 and any("b.mkv" in m for m in warned) and any("c.mkv" in m for m in warned)
+    assert not db.get("a")["warned_at"] and tr.removed == []          # 12 ч назад — ещё рано
+
+    db.set_warned("b", int(time.time()) - 25 * 3600)                  # предупреждён давно, но двух дней ещё нет
+    db.set_warned("c", int(time.time()) - 25 * 3600)                  # и предупреждён, и два дня прошли
+    await main.cleanup_once(bot, st)
+    assert tr.removed == [("c", True)]
+
+    v = cleanup.Verdict("watched", 1, 1, datetime.now() - timedelta(hours=1))
+    assert v.warn_due(datetime.now(), 1, 48)                           # предупреждение длиннее срока — сразу
+    assert not cleanup.Verdict("partial", 2, 1, datetime.now() - timedelta(days=9)).warn_due(datetime.now(), 2, 24)

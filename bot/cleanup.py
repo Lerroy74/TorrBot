@@ -22,6 +22,12 @@ class Verdict:
         return (self.status == "watched" and self.last_played is not None
                 and now - self.last_played >= timedelta(days=days))
 
+    def warn_due(self, now: datetime, days: int, warn_hours: int) -> bool:
+        """v8.3.3: пора предупредить — за warn_hours до срока удаления (срок = days после просмотра)."""
+        lead = max(timedelta(0), timedelta(days=days) - timedelta(hours=warn_hours))
+        return (self.status == "watched" and self.last_played is not None
+                and now - self.last_played >= lead)
+
     def delete_after(self, days: int) -> datetime | None:
         return self.last_played + timedelta(days=days) if self.last_played else None
 

@@ -1518,7 +1518,9 @@ async def cleanup_once(bot: Bot, st: State) -> None:
         h = row["hash"]
         if row["keep"]:
             continue
-        if not v.ready(now, cfg.cleanup_days):
+        # v8.3.3: предупреждаем заранее (за CLEANUP_WARN_HOURS до срока), чтобы удаление пришлось
+        # на CLEANUP_DAYS после просмотра, а не на сутки позже
+        if not v.warn_due(now, cfg.cleanup_days, cfg.cleanup_warn_hours):
             if row["warned_at"]:           # снова начали смотреть — сбрасываем предупреждение
                 st.db.set_warned(h, None)
             continue
@@ -1531,7 +1533,8 @@ async def cleanup_once(bot: Bot, st: State) -> None:
                 await bot.send_message(
                     a, f"🗑 Через {cfg.cleanup_warn_hours} ч удалю просмотренное:\n<b>{name}</b> "
                        f"({fmt_size(t.get('totalSize', 0))}, смотрели {v.last_played:%d.%m})", reply_markup=kb)
-        elif time.time() - row["warned_at"] >= cfg.cleanup_warn_hours * 3600:
+        elif (v.ready(now, cfg.cleanup_days)
+              and time.time() - row["warned_at"] >= cfg.cleanup_warn_hours * 3600):
             await st.tr.remove(h, delete_data=True)
             st.db.mark_removed(h, "cleanup")
             removed_any = True
