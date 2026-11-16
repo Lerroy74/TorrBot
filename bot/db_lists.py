@@ -65,20 +65,6 @@ CREATE TABLE IF NOT EXISTS list_shares (      -- кому открыт личн�
     at         INTEGER,
     PRIMARY KEY (list_id, user_id)
 );
-CREATE TABLE IF NOT EXISTS list_watch (         -- v8.2: что уже сообщали о раздачах фильма из списков
-    user_id    INTEGER,
-    kind       TEXT,
-    tmdb_id    INTEGER,
-    level      INTEGER,                       -- 0 — раздач нет, 1 — есть, 2 — есть хорошего качества
-    at         INTEGER,
-    PRIMARY KEY (user_id, kind, tmdb_id)
-);
-CREATE TABLE IF NOT EXISTS list_watch_film (    -- v8.2: когда проверяли фильм
-    kind       TEXT,
-    tmdb_id    INTEGER,
-    checked_at INTEGER,
-    PRIMARY KEY (kind, tmdb_id)
-);
 CREATE TABLE IF NOT EXISTS ai_usage (         -- расход ИИ по дням
     day        TEXT,
     user_id    INTEGER,
@@ -108,6 +94,27 @@ class ListsDB:
         if first_run:                     # все, кто уже был в боте до v8, могут качать как раньше
             self.c.execute("INSERT OR REPLACE INTO prefs(user_id, key, value) SELECT id, 'can_dl', '1' FROM users")
         self.journal_tmdb_backfill(commit=False)
+        self._v84_merge_lists()
+
+    def _v84_merge_lists(self) -> None:
+        """v8.4: дополнительные подборки больше не нужны — фильмы переезжают в основной список
+        (личный или группы), подборки, открытия и голоса удаляются. Безопасно запускать повторно."""
+        extra = self.c.execute("SELECT * FROM lists WHERE main=0").fetchall()
+        for lst in extra:
+            if lst["user_id"]:
+                target = self.main_list(lst["user_id"])
+            elif lst["group_id"]:
+                target = self.group_main_list(lst["group_id"])
+            else:
+                target = None
+            if target:
+                self.c.execute("INSERT OR IGNORE INTO list_items(list_id, kind, tmdb_id, added_by, added_at,"
+                               " watched_at, watched_by) SELECT ?, kind, tmdb_id, added_by, added_at, watched_at,"
+                               " watched_by FROM list_items WHERE list_id=?", (target, lst["id"]))
+            self._list_wipe(lst["id"])
+        self.c.execute("DELETE FROM list_votes")
+        self.c.execute("DELETE FROM list_shares")
+        self.c.execute("UPDATE lists SET share=NULL WHERE share IS NOT NULL")
 
     def journal_tmdb_backfill(self, commit: bool = True) -> None:
         """Записи журнала без карточки TMDB — взять её из закачек этого названия."""
@@ -147,9 +154,6 @@ class ListsDB:
     def group_get(self, gid: int) -> sqlite3.Row | None:
         return self.c.execute("SELECT * FROM teams WHERE id=?", (gid,)).fetchone()
 
-    def group_by_invite(self, code: str) -> sqlite3.Row | None:
-        return self.c.execute("SELECT * FROM teams WHERE invite=?", (code,)).fetchone()
-
     def groups_of(self, uid: int) -> list[sqlite3.Row]:
         return self.c.execute("SELECT g.* FROM teams g JOIN group_members m ON m.group_id=g.id"
                               " WHERE m.user_id=? ORDER BY g.created_at", (uid,)).fetchall()
@@ -187,16 +191,6 @@ class ListsDB:
             return "owner", new
         self.c.commit()
         return "left", None
-
-    def group_rename(self, gid: int, name: str) -> None:
-        self.c.execute("UPDATE teams SET name=? WHERE id=?", (name[:60], gid))
-        self.c.commit()
-
-    def group_new_invite(self, gid: int) -> str:
-        code = _code()
-        self.c.execute("UPDATE teams SET invite=? WHERE id=?", (code, gid))
-        self.c.commit()
-        return code
 
     def group_delete(self, gid: int, commit: bool = True) -> None:
         for (lid,) in self.c.execute("SELECT id FROM lists WHERE group_id=?", (gid,)).fetchall():
@@ -238,32 +232,18 @@ class ListsDB:
 
     def lists_of_user(self, uid: int) -> list[sqlite3.Row]:
         self.main_list(uid)
-        return self.c.execute("SELECT * FROM lists WHERE user_id=? ORDER BY main DESC, created_at, id",
+        return self.c.execute("SELECT * FROM lists WHERE user_id=? AND main=1 ORDER BY id",
                               (uid,)).fetchall()
 
     def lists_of_group(self, gid: int) -> list[sqlite3.Row]:
         self.group_main_list(gid)
-        return self.c.execute("SELECT * FROM lists WHERE group_id=? ORDER BY main DESC, created_at, id",
+        return self.c.execute("SELECT * FROM lists WHERE group_id=? AND main=1 ORDER BY id",
                               (gid,)).fetchall()
-
-    def list_create(self, name: str, created_by: int, uid: int | None = None, gid: int | None = None) -> int:
-        lid = self.c.execute("INSERT INTO lists(user_id, group_id, name, main, created_by, created_at)"
-                             " VALUES (?,?,?,0,?,?)", (uid, gid, name[:60], created_by, int(time.time()))).lastrowid
-        self.c.commit()
-        return lid
-
-    def list_rename(self, lid: int, name: str) -> None:
-        self.c.execute("UPDATE lists SET name=? WHERE id=?", (name[:60], lid))
-        self.c.commit()
 
     def _list_wipe(self, lid: int) -> None:
         for t in ("list_items", "list_votes", "list_shares"):
             self.c.execute(f"DELETE FROM {t} WHERE list_id=?", (lid,))
         self.c.execute("DELETE FROM lists WHERE id=?", (lid,))
-
-    def list_delete(self, lid: int) -> None:
-        self._list_wipe(lid)
-        self.c.commit()
 
     def list_counts(self, lid: int) -> tuple[int, int]:
         """(непросмотренных, всего)."""
@@ -272,56 +252,33 @@ class ListsDB:
         return int(row[0] or 0), int(row[1] or 0)
 
     def list_items(self, lid: int, watched: bool = False) -> list[sqlite3.Row]:
-        """Фильмы списка с карточкой и числом 👍. watched=False — только непросмотренные.
-        Групповой — больше 👍 выше; личный — новые сверху; просмотренные — в конце."""
-        lst = self.list_get(lid)
-        order = "votes DESC, i.added_at" if lst is not None and lst["group_id"] else "i.added_at DESC"
-        q = ("SELECT i.*, t.title, t.year, t.poster, t.genres,"
-             " (SELECT COUNT(*) FROM list_votes v WHERE v.list_id=i.list_id AND v.kind=i.kind AND v.tmdb_id=i.tmdb_id) AS votes,"
-             " (SELECT group_concat(user_id) FROM list_votes v WHERE v.list_id=i.list_id AND v.kind=i.kind"
-             "  AND v.tmdb_id=i.tmdb_id) AS voters"
+        """Фильмы списка с карточкой. watched=False — только непросмотренные; просмотренные — в конце."""
+        q = ("SELECT i.*, t.title, t.year, t.poster, t.genres"
              " FROM list_items i LEFT JOIN titles t ON t.kind=i.kind AND t.tmdb_id=i.tmdb_id WHERE i.list_id=?")
         if not watched:
             q += " AND i.watched_at IS NULL"
-        q += f" ORDER BY i.watched_at IS NOT NULL, {order}"
+        q += " ORDER BY i.watched_at IS NOT NULL, i.added_at DESC"
         return self.c.execute(q, (lid,)).fetchall()
 
     def list_item(self, lid: int, kind: str, tid: int) -> sqlite3.Row | None:
         return self.c.execute(
-            "SELECT i.*, t.title, t.year, t.poster, t.genres,"
-            " (SELECT COUNT(*) FROM list_votes v WHERE v.list_id=i.list_id AND v.kind=i.kind AND v.tmdb_id=i.tmdb_id) AS votes,"
-            " (SELECT group_concat(user_id) FROM list_votes v WHERE v.list_id=i.list_id AND v.kind=i.kind"
-            "  AND v.tmdb_id=i.tmdb_id) AS voters"
+            "SELECT i.*, t.title, t.year, t.poster, t.genres"
             " FROM list_items i LEFT JOIN titles t ON t.kind=i.kind AND t.tmdb_id=i.tmdb_id"
             " WHERE i.list_id=? AND i.kind=? AND i.tmdb_id=?", (lid, kind, tid)).fetchone()
 
     def list_add(self, lid: int, kind: str, tid: int, uid: int, ts: int | None = None) -> bool:
         cur = self.c.execute("INSERT OR IGNORE INTO list_items(list_id, kind, tmdb_id, added_by, added_at)"
                              " VALUES (?,?,?,?,?)", (lid, kind, tid, uid, ts or int(time.time())))
-        lst = self.list_get(lid)
-        if cur.rowcount and lst is not None and lst["group_id"]:     # в группе — сразу голос автора
-            self.c.execute("INSERT OR IGNORE INTO list_votes VALUES (?,?,?,?)", (lid, kind, tid, uid))
         self.c.commit()
         return cur.rowcount > 0
 
     def list_remove(self, lid: int, kind: str, tid: int) -> None:
         self.c.execute("DELETE FROM list_items WHERE list_id=? AND kind=? AND tmdb_id=?", (lid, kind, tid))
-        self.c.execute("DELETE FROM list_votes WHERE list_id=? AND kind=? AND tmdb_id=?", (lid, kind, tid))
         self.c.commit()
 
     def lists_with(self, kind: str, tid: int) -> set[int]:
         return {r[0] for r in self.c.execute("SELECT list_id FROM list_items WHERE kind=? AND tmdb_id=?",
                                              (kind, tid))}
-
-    def list_vote(self, lid: int, kind: str, tid: int, uid: int) -> bool:
-        """Переключает 👍; True — поставлен."""
-        if self.c.execute("DELETE FROM list_votes WHERE list_id=? AND kind=? AND tmdb_id=? AND user_id=?",
-                          (lid, kind, tid, uid)).rowcount:
-            self.c.commit()
-            return False
-        self.c.execute("INSERT INTO list_votes VALUES (?,?,?,?)", (lid, kind, tid, uid))
-        self.c.commit()
-        return True
 
     def set_watched(self, lid: int, kind: str, tid: int, on: bool, uid: int | None = None) -> None:
         if on:
@@ -348,44 +305,6 @@ class ListsDB:
             (int(time.time()), kind, tid, uid, uid))
         self.c.commit()
         return cur.rowcount
-
-    # ---------- «поделиться» ----------
-    def list_share_code(self, lid: int) -> str:
-        row = self.list_get(lid)
-        if row is not None and row["share"]:
-            return row["share"]
-        code = _code()
-        self.c.execute("UPDATE lists SET share=? WHERE id=?", (code, lid))
-        self.c.commit()
-        return code
-
-    def list_by_share(self, code: str) -> sqlite3.Row | None:
-        return self.c.execute("SELECT * FROM lists WHERE share=?", (code,)).fetchone()
-
-    def share_add(self, lid: int, uid: int) -> bool:
-        cur = self.c.execute("INSERT OR IGNORE INTO list_shares(list_id, user_id, at) VALUES (?,?,?)",
-                             (lid, uid, int(time.time())))
-        self.c.commit()
-        return cur.rowcount > 0
-
-    def shares_of(self, lid: int) -> list[sqlite3.Row]:
-        return self.c.execute("SELECT * FROM list_shares WHERE list_id=? ORDER BY at", (lid,)).fetchall()
-
-    def shared_with(self, uid: int) -> list[sqlite3.Row]:
-        return self.c.execute("SELECT l.* FROM lists l JOIN list_shares s ON s.list_id=l.id WHERE s.user_id=?"
-                              " ORDER BY s.at", (uid,)).fetchall()
-
-    def is_shared_with(self, lid: int, uid: int) -> bool:
-        return self.c.execute("SELECT 1 FROM list_shares WHERE list_id=? AND user_id=?", (lid, uid)).fetchone() is not None
-
-    def share_revoke(self, lid: int, uid: int | None = None) -> None:
-        """Закрыть доступ одному человеку или всем (тогда и ссылка перестаёт работать)."""
-        if uid is None:
-            self.c.execute("DELETE FROM list_shares WHERE list_id=?", (lid,))
-            self.c.execute("UPDATE lists SET share=NULL WHERE id=?", (lid,))
-        else:
-            self.c.execute("DELETE FROM list_shares WHERE list_id=? AND user_id=?", (lid, uid))
-        self.c.commit()
 
     # ---------- оценки по карточке TMDB ----------
     def journal_by_tmdb(self, kind: str, tid: int) -> sqlite3.Row | None:

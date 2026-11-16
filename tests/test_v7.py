@@ -14,7 +14,7 @@ os.environ["TMDB_API_KEY"] = "k"
 
 from test_flows import ADMIN, ALICE, BOB, FakeSession, FakeTr, buttons, mv, rel  # noqa: E402
 
-from bot import ai, extras, guard, jacred, kids, kodi, main, remote, space, stall, subs, tmdb  # noqa: E402
+from bot import ai, extras, guard, jacred, kodi, main, remote, space, stall, subs, tmdb  # noqa: E402
 from bot.config import load  # noqa: E402
 from bot.db import DB  # noqa: E402
 
@@ -409,47 +409,6 @@ async def test_stalled_download_offers_alternatives(env):
     assert h not in st.tr.torrents and ("e" * 40) in st.tr.torrents
     assert st.tr.torrents["e" * 40]["downloadDir"] == "/downloads/movies/Дюна (2021)"
     assert st.db.get(h)["removed_reason"] == "replaced"
-
-
-# ======================= детский режим =======================
-async def test_kids_mode(env):
-    st, session, send, press, mp, bot, _ = env
-    await press(ADMIN, f"ukd:{BOB}")
-    assert kids.is_kid(st, BOB)
-    cartoon = {**mv(1, "Тачки", "2006-06-08", orig="Cars"), "genre_ids": [16, 10751]}
-    horror = {**mv(2, "Тачки-убийцы", "2006-01-01"), "genre_ids": [27]}
-
-    async def fake_find(st_, q):
-        return [cartoon, horror]
-    mp.setattr(main, "find_info", fake_find)
-
-    async def fake_jac(http, cfg, q):
-        return [rel("Тачки / Cars (2006) BDRip 1080p", "f" * 40)]
-    mp.setattr(jacred, "search", fake_jac)
-
-    async def age(http, key, info):
-        return 0
-    mp.setattr(tmdb, "age_rating", age)
-    await send(BOB, "тачки")
-    t = texts(session, BOB)[-1]
-    assert "Cars (2006) BDRip" in t or "Тачки (2006)" in t
-    assert "Тачки-убийцы" not in "".join(texts(session, BOB))
-    await send(BOB, "magnet:?xt=urn:btih:" + "1" * 40)
-    assert "детском режиме" in texts(session, BOB)[-1] and not st.tr.torrents
-    listing = next(m for m in reversed(session.sent(BOB)) if "Cars (2006) BDRip" in m[1])
-    dl = [b for b in buttons(listing[2]) if b.text == "⬇ 1"]
-    await press(BOB, dl[0].callback_data)
-    assert ("f" * 40) in st.tr.torrents
-    info = tmdb._to_info(horror)
-    ok, why = await kids.allowed(st, BOB, info)
-    assert not ok and "не мультфильм" in why
-    ok, _ = await kids.allowed(st, ALICE, info)
-    assert ok
-
-
-def test_age_from():
-    assert tmdb.age_from({"RU": "16+"}) == 16 and tmdb.age_from({"US": "PG-13"}) == 13
-    assert tmdb.age_from({}) is None
 
 
 # ======================= подписки =======================

@@ -105,8 +105,12 @@ case "$1" in
     [ -f "$STATE/tunnel.why" ] && echo "причина обрыва туннеля: $(cat "$STATE/tunnel.why")"
     exit 0;;
   --why)
-    w=$(diagnose); echo "без туннеля: ${w#* }"
     c=$(curl -s -m 20 -x "$PROXY" -o /dev/null -w '%{http_code}' "$URL"); echo "через туннель ($PROXY): ответ ${c:-нет}"
+    case "$c" in
+      2??|3??) echo "туннель работает — причин искать не нужно."
+               [ -f "$STATE/tunnel.why" ] && echo "(последний обрыв: $(cat "$STATE/tunnel.why"))";;
+      *) w=$(diagnose); echo "туннель не отвечает. Проверка без него: ${w#* }";;
+    esac
     exit 0;;
   --log)
     tail -n "${2:-40}" "$LOG" 2>/dev/null || echo "журнал пуст"; exit 0;;

@@ -15,7 +15,7 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, InlineQue
                            InlineQueryResultArticle, InlineQueryResultPhoto, InlineQueryResultsButton,
                            InputTextMessageContent, Message)
 
-from . import kids, tmdb
+from . import tmdb
 
 log = logging.getLogger("torrbot.inline")
 THUMB = "https://image.tmdb.org/t/p/w185"
@@ -77,7 +77,7 @@ def build_router(st) -> Router:
             return
         cands = await st.hooks["find_info"](query)
         _, year = tmdb.split_query(query)
-        infos = kids.only_kids(st, uid, tmdb.choices(cands, year, 20))[:10]
+        infos = tmdb.choices(cands, year, 20)[:10]
         for inf in infos:
             st.infos[("t" if inf.is_tv else "m", inf.tmdb_id)] = inf
         try:
@@ -96,10 +96,6 @@ async def open_from_start(st, msg: Message, uid: int, arg: str) -> bool:
     info = await st.hooks["info_for"](m.group(1), int(m.group(2)))
     if not info:
         await msg.answer("Не смог открыть фильм — TMDB не отвечает, попробуй позже или напиши название.")
-        return True
-    ok, why = await kids.allowed(st, uid, info)
-    if not ok:
-        await msg.answer(why or "Этот фильм в детском режиме недоступен.")
         return True
     await st.hooks["search_for"](msg, info, uid=uid)
     return True

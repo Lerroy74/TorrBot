@@ -53,19 +53,6 @@ def test_migration_from_v71(tmp_path):
     db = DB(path)
     assert db.flag(100, "can_dl") and db.flag(200, "can_dl")          # старые пользователи качают как раньше
 
-    class St:
-        pass
-    st = St()
-    st.db = db
-    st.cfg = type("C", (), {"admin_ids": (1,)})()
-    lists.setup(st)
-    groups = db.groups_of(1)
-    assert [g["name"] for g in groups] == ["Семья"] and [m["user_id"] for m in db.group_members(groups[0]["id"])] == [1]
-    lid = db.group_main_list(groups[0]["id"])
-    items = db.list_items(lid)
-    assert [(i["title"], i["votes"]) for i in items] == [("Матрица", 2), ("Игра престолов", 1)]
-    lists.setup(st)                                                    # второй раз — ничего не дублирует
-    assert len(db.groups_of(1)) == 1
     db.allow(300, "Новенькая")
     assert not db.flag(300, "can_dl")                                  # новые — без права качать
 
@@ -83,46 +70,37 @@ def test_journal_gets_tmdb_from_downloads(tmp_path):
     assert db.journal_get(j2)["src"] is None and db.journal_get(j2)["deleted_at"] is None
 
 
-# ---------- группы и приглашения ----------
-async def test_group_invite_flow(env):
+# ---------- группа (v8.4: состав — только у админа) ----------
+async def test_group_managed_by_admin_only(env):
     st, session, send, press, mp = env
-    await send(ALICE, "/gruppy")
-    await press(ALICE, "Gn")
-    await send(ALICE, "Киноклуб")                                     # название ловится, а не ищется
-    text = last(session, ALICE)[1]
-    assert "Группа создана" in text and "Киноклуб" in text
-    g = st.db.groups_of(ALICE)[0]
-    code = g["invite"]
-    assert f"g_{code}" in text
+    await press(ALICE, "Gn")                                           # не админ — нельзя
+    assert "администратора" in session.alerts()[-1] and not st.db.groups_of(ALICE)
+    await press(ADMIN, "Gn")
+    g = st.db.groups_of(ADMIN)[0]
+    assert g["name"] == "Семья"
+    await press(ADMIN, "Gn")                                           # повторно — второй не создаётся
+    assert len(st.db.groups_of(ADMIN)) == 1
+    await press(ADMIN, f"GA:{g['id']}:{ALICE}")
+    await press(ADMIN, f"GA:{g['id']}:{BOB}")
+    assert st.db.is_member(g["id"], ALICE) and st.db.is_member(g["id"], BOB)
+    await press(ALICE, f"Gv:{g['id']}")
+    text, kb = last(session, ALICE)[1], last(session, ALICE)[2]
+    assert "Семья" in text and "Алиса" in text and "t.me" not in text
+    assert not any("Убрать человека" in b.text or "Добавить" in b.text for b in buttons(kb))
+    await press(ALICE, f"GK:{g['id']}:{BOB}")                          # участник убрать не может
+    assert st.db.is_member(g["id"], BOB)
+    await press(ADMIN, f"GK:{g['id']}:{BOB}")
+    assert not st.db.is_member(g["id"], BOB)
 
-    # Боб уже в боте — сразу вступает, Алисе приходит сообщение
-    await send(BOB, f"/start g_{code}")
-    assert st.db.is_member(g["id"], BOB) and "Ты в группе «Киноклуб»" in last(session, BOB)[1]
-    assert "вступил(а)" in last(session, ALICE)[1]
 
-    # новенькая — заявка админу с пометкой; после ✅ — сразу в группе, но без права качать
-    await send(CAROL, f"/start g_{code}")
-    req = last(session, ADMIN)[1]
-    assert "Запрос доступа" in req and "приглашение в группу «Киноклуб» от Алиса" in req
-    await press(ADMIN, f"ok:{CAROL}")
-    assert st.db.is_member(g["id"], CAROL) and not st.hooks["may_download"](CAROL)
-    assert any("Ты в группе «Киноклуб»" in t for _, t, _ in session.sent(CAROL))
-
-    # новая ссылка — старая не работает
-    await press(ALICE, f"Gi:{g['id']}")
-    await send(BOB, f"/start g_{code}")
-    assert "устарела" in last(session, BOB)[1]
-
-    # владелец уходит — группа к самому давнему участнику (Боб); последний — группа удаляется
-    await press(ALICE, f"Gl:{g['id']}")
-    assert "перейдёт к Боб" in last(session, ALICE)[1]
-    await press(ALICE, f"GL:{g['id']}")
-    assert st.db.group_get(g["id"])["owner_id"] == BOB
-    assert "владелец" in last(session, BOB)[1]
-    await press(BOB, f"GK:{g['id']}:{CAROL}")                          # владелец убирает участника
-    assert not st.db.is_member(g["id"], CAROL)
-    await press(BOB, f"GL:{g['id']}")
-    assert st.db.group_get(g["id"]) is None
+async def test_removed_buttons_and_old_invite_links_are_harmless(env):
+    st, session, send, press, mp = env
+    for data in ("Ln:0", "Le:1", "Lx:1", "LX:1", "Ls:1", "Lo:1:0", "Lu:1:m:1:0:0", "Ge:1", "Gi:1", "Gl:1", "GL:1", "Gx:1", "GX:1"):
+        await press(ALICE, data)
+        assert "убрали" in session.alerts()[-1], data
+    assert ALICE not in st.awaiting
+    await send(BOB, "/start g_abc123")                                  # старая ссылка — просто справка
+    assert "/lists" in last(session, BOB)[1]
 
 
 async def test_admin_adds_bot_user_to_group(env):
@@ -137,7 +115,7 @@ async def test_admin_adds_bot_user_to_group(env):
 
 
 # ---------- списки ----------
-async def test_group_list_votes_rights_and_seen_marks(env):
+async def test_group_list_rights_and_seen_marks(env):
     st, session, send, press, mp = env
     gid = st.db.group_create("Семья", ALICE)
     st.db.group_join(gid, BOB)
@@ -146,11 +124,9 @@ async def test_group_list_votes_rights_and_seen_marks(env):
         lists.remember_info(st, info(i, t, d))
     await press(ALICE, f"Lt:{lid}:m:1")
     await press(BOB, f"Lt:{lid}:m:2")
-    await press(ALICE, f"Lu:{lid}:m:2:0:0")                            # 👍 Амели от Алисы → 2 голоса, выше
-    text = list(st.db.list_items(lid))
-    assert [i["title"] for i in text] == ["Амели", "Матрица"] and text[0]["votes"] == 2
+    assert {i["title"] for i in st.db.list_items(lid)} == {"Амели", "Матрица"}
 
-    # Боб не может убрать фильм Алисы, Алиса (владелец) — может любой
+    # Боб не может убрать фильм Алисы
     await press(BOB, f"Ly:{lid}:m:1:0:0")
     assert "Убрать может" in session.alerts()[-1] and st.db.list_item(lid, "m", 1)
 
@@ -185,58 +161,27 @@ async def test_personal_list_rating_marks_watched_and_podborka(env):
     assert st.db.scores_by_tmdb(ALICE)[("m", 5)] == 8
     await send(ALICE, "/ocenki")
     assert "Дюна (2021)" in last(session, ALICE)[1]
-    # новая подборка с фильмом через ввод названия; Боб удалить её не может
-    await press(ALICE, "Ln:0:m:5")
-    await send(ALICE, "На Новый год")
-    new = [x for x in st.db.lists_of_user(ALICE) if x["name"] == "На Новый год"][0]
-    assert st.db.list_item(new["id"], "m", 5)
-    await press(BOB, f"LX:{new['id']}")
-    assert st.db.list_get(new["id"]) is not None
-    await press(ALICE, f"LX:{new['id']}")
-    assert st.db.list_get(new["id"]) is None
 
 
-async def test_share_list_read_only_and_revoke(env):
-    st, session, send, press, mp = env
-    lists.remember_info(st, info(7, "Интерстеллар", "2014-11-05"))
-    lid = st.db.main_list(ALICE)
-    st.db.list_add(lid, "m", 7, ALICE)
-    await press(ALICE, "Lq:0:m:7:0:0:10")
-    await press(ALICE, f"Ls:{lid}")
-    code = st.db.list_get(lid)["share"]
-    assert f"l_{code}" in last(session, ALICE)[1]
-    await send(BOB, f"/start l_{code}")
-    assert "открыл(а) тебе список" in last(session, BOB)[1]
-    await press(BOB, f"Lv:{lid}:0:0")
-    t = last(session, BOB)[1]
-    assert "Интерстеллар" in t and "автор: 10" in t and "Открыт тебе" in t
-    await press(BOB, f"Li:{lid}:m:7:0:0")
-    kb = last(session, BOB)[2]
-    assert "➕ Себе" in [b.text for b in buttons(kb)] and not any("Убрать" in b.text for b in buttons(kb))
-    await press(BOB, f"Lt:{lid}:m:7")                                  # в чужой список добавлять нельзя
-    assert "нельзя" in session.alerts()[-1]
-    await press(BOB, f"Lt:{st.db.main_list(BOB)}:m:7")                 # «➕ Себе»
-    assert st.db.list_item(st.db.main_list(BOB), "m", 7)
-    await press(ALICE, f"Lo:{lid}:0")                                  # закрыть для всех
-    await press(BOB, f"Lv:{lid}:0:0")
-    assert "не доступен" in last(session, BOB)[1] and st.db.list_get(lid)["share"] not in (None, code)
-    await send(BOB, f"/start l_{code}")                                # старая ссылка больше не работает
-    assert "устарела" in last(session, BOB)[1]
-
-
-async def test_kids_see_only_kids_items(env):
-    st, session, send, press, mp = env
-    st.db.set_flag(BOB, "kids", True)
-    gid = st.db.group_create("Семья", ALICE)
-    st.db.group_join(gid, BOB)
-    lid = st.db.group_main_list(gid)
-    lists.remember_info(st, info(10, "Пила", "2004-10-01", genres=[27]))
-    lists.remember_info(st, info(11, "Тачки", "2006-06-08", genres=[16, 10751]))
-    st.db.list_add(lid, "m", 10, ALICE)
-    st.db.list_add(lid, "m", 11, ALICE)
-    await press(BOB, f"Lv:{lid}:0:0")
-    t = last(session, BOB)[1]
-    assert "Тачки" in t and "Пила" not in t
+def test_v84_merges_extra_lists_into_main(tmp_path):
+    path = str(tmp_path / "m.sqlite3")
+    db = DB(path)
+    main = db.main_list(ALICE)
+    db.list_add(main, "m", 1, ALICE)
+    c = db.c
+    extra = c.execute("INSERT INTO lists(user_id, name, main, created_by, created_at) VALUES (?,?,0,?,1)",
+                      (ALICE, "На Новый год", ALICE)).lastrowid
+    c.execute("INSERT INTO list_items(list_id, kind, tmdb_id, added_by, added_at) VALUES (?,?,?,?,1)", (extra, "m", 2, ALICE))
+    c.execute("INSERT INTO list_items(list_id, kind, tmdb_id, added_by, added_at) VALUES (?,?,?,?,1)", (extra, "m", 1, ALICE))
+    c.execute("INSERT INTO list_shares(list_id, user_id, at) VALUES (?,?,1)", (main, BOB))
+    c.execute("INSERT INTO list_votes VALUES (?,?,?,?)", (main, "m", 1, BOB))
+    c.commit()
+    db._v84_merge_lists()
+    db._v84_merge_lists()                                              # повторный запуск безопасен
+    assert db.list_get(extra) is None
+    assert {(i["kind"], i["tmdb_id"]) for i in db.list_items(main)} == {("m", 1), ("m", 2)}
+    assert [r["id"] for r in db.lists_of_user(ALICE)] == [main]
+    assert not c.execute("SELECT 1 FROM list_shares").fetchone() and not c.execute("SELECT 1 FROM list_votes").fetchone()
 
 
 # ---------- лёгкий режим (без права качать) ----------
@@ -470,12 +415,12 @@ async def test_approve_with_download_and_input_reset(env):
     await send(CAROL, "/start")
     await press(ADMIN, f"okd:{CAROL}")
     assert st.hooks["may_download"](CAROL)
-    # начал создавать подборку, но передумал и пошёл искать фильм — название не «съедается»
-    await press(ALICE, "Ln:0")
+    # начал вводить запрос к ИИ-подбору, но передумал и пошёл искать фильм — текст не «съедается»
+    st.hooks["ask_input"](ALICE, ("ai_rec",))
     assert ALICE in st.awaiting
     await press(ALICE, "Lm")
     assert ALICE not in st.awaiting
-    await press(ALICE, "Ln:0")
+    st.hooks["ask_input"](ALICE, ("ai_rec",))
     await send(ALICE, "/lists")
     assert ALICE not in st.awaiting
 

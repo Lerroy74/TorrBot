@@ -3,7 +3,7 @@
 * 🎯 «Похожее на мои любимые» — без ИИ: рекомендации TMDB к фильмам, которые человек оценил на 8+
   (нет таких — к фильмам из его списков). Чем к большему числу любимых подходит, тем выше.
   Убирается то, что он уже оценил/отметил «не смотрел(а)» и что уже лежит в его списках.
-* 👥 «Что посмотреть вместе» — для группы: непросмотренное из группового списка (по 👍) +
+* 👥 «Что посмотреть вместе» — для группы: непросмотренное из группового списка +
   рекомендации TMDB к тому, что высоко оценили несколько участников. Уже виденное кем-то из
   группы не убирается — только пометка «Лена уже видела (8)».
 * 🤖 «Спросить ИИ» — свободный запрос + лучшие оценки человека → ИИ (через /ai-контроль) → TMDB.
@@ -19,7 +19,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
 from . import ai, aictl, picks, tmdb
-from .lists import is_kid, kid_ok_row, label, name_of, remember_info, seen_marks
+from .lists import label, name_of, remember_info, seen_marks
 
 log = logging.getLogger("torrbot")
 esc = html.escape
@@ -124,8 +124,6 @@ async def similar(st, uid: int) -> tuple[str, InlineKeyboardMarkup]:
     mine = {(it["kind"], it["tmdb_id"]) for lst in st.db.lists_of_user(uid) for it in st.db.list_items(lst["id"], True)}
     skip = answered | mine | {k for k, _ in seeds}
     found = [(i, n, s) for i, n, s in await collect(st, seeds) if key(i) not in skip]
-    if is_kid(st, uid):
-        found = [x for x in found if tmdb.kid_ok(x[0])]
     if not found:
         return "🎯 Ничего нового не нашлось — оцени ещё что-нибудь, и попробуем снова.", kb([])
     items = [(i, f"похоже на: {s}" + (f" и ещё {n - 1}" if n > 1 else "")) for i, n, s in found[:SHOW]]
@@ -140,13 +138,13 @@ async def together(st, gid: int, uid: int) -> tuple[str, InlineKeyboardMarkup]:
     members = {m["user_id"] for m in st.db.group_members(gid)}
     lid = st.db.group_main_list(gid)
     head = [f"👥 <b>{esc(g['name'])}: что посмотреть вместе</b>"]
-    want = [it for it in st.db.list_items(lid, False) if not is_kid(st, uid) or kid_ok_row(it)][:5]
+    want = st.db.list_items(lid, False)[:5]
     if want:
-        head.append("\n<b>Из вашего списка</b> (больше 👍 — выше):")
+        head.append("\n<b>Из вашего списка</b>:")
         for it in want:
             seen = seen_marks(st, it["kind"], it["tmdb_id"], members)
             head.append(f"• {'📺' if it['kind'] == 't' else '🎬'} {esc(label(it))}"
-                        + (f" — 👍 {it['votes']}" if it["votes"] else "") + (f" · видели: {esc(seen)}" if seen else ""))
+                        + (f" — видели: {esc(seen)}" if seen else ""))
     have = {(it["kind"], it["tmdb_id"]) for lst in st.db.lists_of_group(gid) for it in st.db.list_items(lst["id"], True)}
     seeds = []
     for row in st.db.top_rated(sorted(members), 8, SEEDS):
@@ -157,8 +155,6 @@ async def together(st, gid: int, uid: int) -> tuple[str, InlineKeyboardMarkup]:
     if seeds and st.cfg.tmdb_key:
         found = [(i, n, s) for i, n, s in await collect(st, seeds)
                  if key(i) not in have and key(i) not in {k for k, _ in seeds}]
-        if is_kid(st, uid):
-            found = [x for x in found if tmdb.kid_ok(x[0])]
         for info, n, s in found[:8]:
             seen = []
             for r in st.db.scores_for(*key(info)):
@@ -269,8 +265,6 @@ def build_router(st) -> Router:
         infos = await ai.resolve(st.tmdb_http, st.cfg.tmdb_key, guesses, st.cfg.tmdb_lang) if guesses else []
         answered = set(st.db.scores_by_tmdb(uid))
         infos = [i for i in infos if key(i) not in answered]
-        if is_kid(st, uid):
-            infos = [i for i in infos if tmdb.kid_ok(i)]
         if not infos:
             await wait.edit_text("🤖 ИИ не предложил ничего нового. Попробуй сформулировать иначе или без ИИ:",
                                  reply_markup=fallback)

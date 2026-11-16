@@ -32,22 +32,6 @@ CREATE TABLE IF NOT EXISTS prefs (
     value     TEXT,
     PRIMARY KEY (user_id, key)
 );
-CREATE TABLE IF NOT EXISTS wishlist (
-    kind      TEXT,
-    tmdb_id   INTEGER,
-    title     TEXT,
-    year      TEXT,
-    poster    TEXT,
-    added_by  INTEGER,
-    added_at  INTEGER,
-    PRIMARY KEY (kind, tmdb_id)
-);
-CREATE TABLE IF NOT EXISTS votes (
-    kind      TEXT,
-    tmdb_id   INTEGER,
-    user_id   INTEGER,
-    PRIMARY KEY (kind, tmdb_id, user_id)
-);
 CREATE TABLE IF NOT EXISTS downloads (
     hash      TEXT PRIMARY KEY,
     name      TEXT,
@@ -136,6 +120,13 @@ CREATE TABLE IF NOT EXISTS deletions (
     kind      TEXT,
     label     TEXT,
     size      INTEGER
+);
+CREATE TABLE IF NOT EXISTS usage (           -- v8.4: сколько раз пользовались функцией (по дням и людям)
+    day       TEXT,                          -- ГГГГ-ММ-ДД, местное время
+    feature   TEXT,
+    user_id   INTEGER,
+    n         INTEGER DEFAULT 0,
+    PRIMARY KEY (day, feature, user_id)
 );
 """
 
@@ -308,35 +299,6 @@ class DB(ListsDB):
         self.c.execute("INSERT OR REPLACE INTO prefs(user_id, key, value) VALUES (?,?,?)", (uid, key, value))
         self.c.commit()
 
-    # --- «Хотим посмотреть» ---
-    def wish_add(self, kind: str, tid: int, title: str, year: str, poster: str | None, uid: int) -> bool:
-        added = self.c.execute("INSERT OR IGNORE INTO wishlist VALUES (?,?,?,?,?,?,?)",
-                               (kind, tid, title, year, poster, uid, int(time.time()))).rowcount > 0
-        if added:                      # голос автора; остальные голосуют через wish_vote
-            self.c.execute("INSERT OR IGNORE INTO votes VALUES (?,?,?)", (kind, tid, uid))
-        self.c.commit()
-        return added
-
-    def wish_remove(self, kind: str, tid: int) -> None:
-        self.c.execute("DELETE FROM wishlist WHERE kind=? AND tmdb_id=?", (kind, tid))
-        self.c.execute("DELETE FROM votes WHERE kind=? AND tmdb_id=?", (kind, tid))
-        self.c.commit()
-
-    def wish_vote(self, kind: str, tid: int, uid: int) -> bool:
-        """Переключает голос; True — голос поставлен."""
-        if self.c.execute("DELETE FROM votes WHERE kind=? AND tmdb_id=? AND user_id=?", (kind, tid, uid)).rowcount:
-            self.c.commit()
-            return False
-        self.c.execute("INSERT INTO votes VALUES (?,?,?)", (kind, tid, uid))
-        self.c.commit()
-        return True
-
-    def wishlist(self) -> list[sqlite3.Row]:
-        return self.c.execute(
-            "SELECT w.*, (SELECT COUNT(*) FROM votes v WHERE v.kind=w.kind AND v.tmdb_id=w.tmdb_id) AS n,"
-            " (SELECT group_concat(user_id) FROM votes v WHERE v.kind=w.kind AND v.tmdb_id=w.tmdb_id) AS voters"
-            " FROM wishlist w ORDER BY n DESC, added_at").fetchall()
-
     def finished(self) -> list[sqlite3.Row]:
         """Докачанные и ещё не удалённые — кандидаты на автоочистку."""
         return self.c.execute(
@@ -362,7 +324,7 @@ class DB(ListsDB):
             self.c.execute("DELETE FROM prefs WHERE user_id=? AND key='can_delete'", (uid,))
             self.c.commit()
 
-    # --- пульт и детский режим (v7) ---
+    # --- пульт (v7) ---
     def flag(self, uid: int, key: str) -> bool:
         return self.pref(uid, key) == "1"
 

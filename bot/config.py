@@ -104,7 +104,6 @@ class Config:
     wait_check_hours: float = 12       # «⏳ ждать хорошее качество»: как часто искать
     wait_min_height: int = 1080
     wait_days: int = 180               # сколько ждать, потом забыть
-    kids_max_age: int = 12             # детский режим: возрастной рейтинг не выше
     disk_reserve_gb: float = 5         # запас места, который не занимаем закачками
     stall_hours: float = 3             # закачка без движения N часов — предложить другие раздачи
     turtle_down_mb: float = 5          # «черепаха»: МБ/с на закачку
@@ -127,7 +126,6 @@ class Config:
     itogi_hour: int = 19               # …в этот час
     stt_max_sec: int = 30              # голосовые длиннее — не распознаём
     stt_price: float = 0.1626          # ₽ за 15 секунд распознавания (прайс Яндекса 2026, с НДС)
-    listwatch_hours: float = 12        # как часто проверять раздачи для фильмов из списков
     update_dir: str = "/data/update"   # куда бот кладёт архив для обновления (видит программа на сервере)
 
 
@@ -206,7 +204,6 @@ def load() -> Config:
         wait_check_hours=float(_str("WAIT_CHECK_HOURS", "12")),
         wait_min_height=int(_str("WAIT_MIN_HEIGHT", "1080")),
         wait_days=int(_str("WAIT_DAYS", "180")),
-        kids_max_age=int(_str("KIDS_MAX_AGE", "12")),
         disk_reserve_gb=float(_str("DISK_RESERVE_GB", "5")),
         stall_hours=float(_str("STALL_HOURS", "3")),
         turtle_down_mb=float(_str("TURTLE_DOWN_MB", "5")),
@@ -226,7 +223,6 @@ def load() -> Config:
         itogi_hour=int(_str("ITOGI_HOUR", "19") or 19),
         stt_max_sec=int(_str("STT_MAX_SEC", "30") or 30),
         stt_price=float((_str("AI_PRICE_STT", "0.1626") or "0").replace(",", ".")),
-        listwatch_hours=float(_str("LISTWATCH_HOURS", "12") or 12),
         update_dir=_str("UPDATE_DIR", "/data/update"),
         ai_prices=tuple((n, float(_str(f"AI_PRICE_{n.upper()}").replace(",", "."))) for n in ("yandex", "groq", "gemini")
                         if _str(f"AI_PRICE_{n.upper()}")),

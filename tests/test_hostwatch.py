@@ -150,3 +150,12 @@ def test_short_blip_is_silent(hw):
     hw.tunnel("000"); hw.run()
     hw.tunnel("204"); hw.run()
     assert hw.sent() == [] and "неудача 1" in hw.log()
+
+
+def test_why_does_not_blame_xray_when_tunnel_works(hw):
+    hw.tunnel("204")
+    out = hw.run("--why")
+    assert "туннель работает" in out and "через xray запросы не идут" not in out
+    hw.tunnel("000")
+    out = hw.run("--why")
+    assert "туннель не отвечает" in out and "через xray запросы не идут" in out

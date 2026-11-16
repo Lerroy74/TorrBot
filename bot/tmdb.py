@@ -28,7 +28,7 @@ class Info:
     rating: float
     poster: str | None
     cast: list[str] = field(default_factory=list)     # главные актёры (заполняется отдельно)
-    genres: list[int] = field(default_factory=list)   # id жанров TMDB (для детского режима)
+    genres: list[int] = field(default_factory=list)   # id жанров TMDB (для итогов и списков)
 
     def caption(self, max_overview: int = 600) -> str:
         """Подпись к обложке (HTML, укладывается в лимит Telegram 1024 символа)."""
@@ -413,45 +413,6 @@ async def collection(http: aiohttp.ClientSession, key: str, cid: int, lang: str 
             parts.append(c)
     parts.sort(key=lambda c: c["release_date"])
     return data.get("name") or "", [_to_info(c) for c in parts]
-
-
-# ---------- v7: детский режим ----------
-KIDS_GENRES = {16, 10751, 10762}          # мультфильм, семейный, детский (у сериалов)
-
-
-def kid_ok(info: Info) -> bool:
-    """Подходит для детского режима по жанрам (мультфильм / семейное / детское)."""
-    return bool(set(info.genres) & KIDS_GENRES)
-
-
-_RE_AGE = re.compile(r"(\d{1,2})")
-_US_AGE = {"G": 0, "PG": 8, "PG-13": 13, "R": 17, "NC-17": 18, "TV-Y": 0, "TV-Y7": 7, "TV-G": 0,
-           "TV-PG": 8, "TV-14": 14, "TV-MA": 17}
-
-
-def age_from(certs: dict[str, str]) -> int | None:
-    """Возраст из рейтингов по странам: сначала RU («12+»), потом US (PG-13 → 13)."""
-    ru = certs.get("RU") or ""
-    m = _RE_AGE.search(ru)
-    if m:
-        return int(m.group(1))
-    us = (certs.get("US") or "").upper()
-    return _US_AGE.get(us)
-
-
-async def age_rating(http: aiohttp.ClientSession, key: str, info: Info) -> int | None:
-    """Возрастной рейтинг (RU, иначе US); неизвестно — None."""
-    if info.is_tv:
-        data = await _get(http, key, f"/tv/{info.tmdb_id}/content_ratings", {})
-        certs = {r.get("iso_3166_1"): r.get("rating") or "" for r in data.get("results") or []}
-    else:
-        data = await _get(http, key, f"/movie/{info.tmdb_id}/release_dates", {})
-        certs = {}
-        for r in data.get("results") or []:
-            for d in r.get("release_dates") or []:
-                if d.get("certification"):
-                    certs.setdefault(r.get("iso_3166_1"), d["certification"])
-    return age_from(certs)
 
 
 # ---------- v7: состояние сериала (для подписки) ----------

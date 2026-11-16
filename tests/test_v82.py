@@ -160,43 +160,6 @@ async def _list():
     return []
 
 
-async def test_listwatch_quiet_first_then_notifies(env):
-    st, session, send, press, mp = env
-    from bot import listwatch, lists
-    st.db.allow(CAROL, "Карина")                           # лёгкий режим
-    for u in (ALICE, CAROL):
-        st.db.list_add(st.db.main_list(u), "m", 105, u)
-    st.db.set_flag(ALICE, "lwatch", True)
-    st.db.set_flag(CAROL, "lwatch", True)
-
-    async def fake_info_for(st_, kind, tid, full=False):
-        return tmdb._to_info(mv(tid, "Назад в будущее", "1985-07-03"))
-    mp.setattr(lists, "info_for", fake_info_for)
-    stock = [item("Назад в будущее (1985) DVDRip 720p", "1" * 40, height=720)]
-
-    async def fake_jac(http, cfg, q):
-        return stock
-    mp.setattr(jacred, "search", fake_jac)
-    t0 = 1_000_000
-    assert await listwatch.check_once(st._bot, st, t0) == 0          # первая проверка — тихо
-    stock.append(item("Назад в будущее (1985) BDRip 1080p", "2" * 40))
-    assert await listwatch.check_once(st._bot, st, t0 + 3600) == 0   # рано — не проверяем
-    assert await listwatch.check_once(st._bot, st, t0 + 13 * 3600) == 2
-    a = [m for m in session.calls if getattr(m, "chat_id", None) == ALICE and "🔔" in (getattr(m, "text", "") or "")]
-    c = [m for m in session.calls if getattr(m, "chat_id", None) == CAROL and "🔔" in (getattr(m, "text", "") or "")]
-    assert "хорошая раздача (1080p)" in a[-1].text and buttons(a[-1].reply_markup)[0].callback_data == "Ld:m:105"
-    assert buttons(c[-1].reply_markup)[0].copy_text
-    assert await listwatch.check_once(st._bot, st, t0 + 26 * 3600) == 0     # второй раз о том же — нет
-
-
-async def test_listwatch_toggle_in_lists(env):
-    st, session, send, press, mp = env
-    await send(ALICE, "/lists")
-    assert any(b.callback_data == "Lp" for b in buttons(session.sent(ALICE)[-1][2]))
-    await press(ALICE, "Lp")
-    assert st.db.flag(ALICE, "lwatch")
-
-
 def make_zip(files: dict) -> bytes:
     import io
     import zipfile

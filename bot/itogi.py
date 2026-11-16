@@ -178,6 +178,15 @@ async def send_all(bot: Bot, st, year: int) -> int:
         except Exception as e:
             log.info("итоги %s: %r", uid, e)
         await asyncio.sleep(0.2)
+    for a in st.cfg.admin_ids:                      # v8.4: админу — ещё и статистика использования бота за год
+        if st.db.pref(a, f"stats_{year}"):
+            continue
+        try:
+            from . import stats
+            await bot.send_message(a, stats.whole_year(st, year))
+            st.db.set_pref(a, f"stats_{year}", "1")
+        except Exception as e:
+            log.info("статистика %s: %r", a, e)
     return sent
 
 

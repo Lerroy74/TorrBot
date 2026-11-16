@@ -107,6 +107,8 @@ def env(tmp_path, monkeypatch):
     from bot import picks
     picks.install(bot)                     # v8.1: выбор номером
     dp = Dispatcher()
+    from bot import stats
+    stats.install(dp, st)                  # v8.4: счётчик использования
     dp.include_router(extras.build_router(st))
     dp.include_router(main.build_router(st))
     upd = itertools.count(1)

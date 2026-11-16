@@ -18,12 +18,12 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, CopyTextButton,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
-from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kids, kodi, lists, nfo, picks,
+from . import (__version__, ai, aictl, cleanup, deleter, extras, jacred, journal, kodi, lists, nfo, picks,
                recs, remote, space, stall, subs, tmdb, wiki)
 from .access import DL, NO_DL, may_download
 from .access import AI as AI_FLAG
 from . import guard as loadguard
-from . import inline, itogi, listwatch, updater, voice
+from . import inline, itogi, stats, updater, voice
 from .config import Config, load
 from .db import DB
 from .transmission import Transmission, TransmissionError
@@ -62,7 +62,7 @@ class State:
         self.sub_meta_done: set[str] = set()      # раздачи подписок, где уже отметили «не качать»
         self.wait_hint: dict[str, tuple] = {}     # sid раздач → (kind, tmdb_id) для кнопки «⏳ ждать»
         # v8
-        self.awaiting: dict[int, tuple] = {}      # uid → (время, что ждём текстом: название подборки/группы, запрос к ИИ)
+        self.awaiting: dict[int, tuple] = {}      # uid → (время, что ждём текстом: запрос к ИИ-подбору, запрос к ИИ)
         self.bot_username: str = ""
         self.stt_http = None                      # v8.2: сессия для SpeechKit (голосовые)
 
@@ -357,7 +357,6 @@ def user_stats(st: State, u, sizes: dict[str, int]) -> str:
     on_disk = sum(sizes.get(d["hash"], 0) for d in dl if not d["removed"])
     rights = [x for x, on in (("⬇ качает", st.db.flag(u["id"], DL)), ("🗑 удаляет", st.db.can_delete(u["id"])),
                               ("📺 пульт", st.db.flag(u["id"], remote.REMOTE)),
-                              ("🧸 детский режим", st.db.flag(u["id"], kids.KIDS)),
                               ("🤖 ИИ", st.db.flag(u["id"], AI_FLAG))) if on]
     return (f"   с {datetime.fromtimestamp(u['added_at'] or 0):%d.%m.%y} · был: {fmt_day(u['last_seen'])}\n"
             f"   закачек: {len(dl)} · на диске: {fmt_size(on_disk)}"
@@ -405,7 +404,7 @@ async def users_view(st: State) -> tuple[str, InlineKeyboardMarkup]:
         rows += [[InlineKeyboardButton(text=f"↩ Разблокировать {(b['name'] or str(b['id']))[:18]}",
                                        callback_data=f"uub:{b['id']}")] for b in blocked[:10]]
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="uref")])
-    text = "\n\n".join(lines) + ("\n\n⚙ — права человека: качать, удалять, пульт, детский режим, ИИ, убрать доступ."
+    text = "\n\n".join(lines) + ("\n\n⚙ — права человека: качать, удалять, пульт, ИИ, убрать доступ."
                                   if users else "")
     return picks.finish(text, numbers, "права человека"), InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -415,7 +414,7 @@ async def user_card(st: State, uid: int) -> tuple[str, InlineKeyboardMarkup] | N
     if u is None:
         return None
     sizes = await torrent_sizes(st)
-    can_del, can_tv, kid = st.db.can_delete(uid), st.db.flag(uid, remote.REMOTE), st.db.flag(uid, kids.KIDS)
+    can_del, can_tv = st.db.can_delete(uid), st.db.flag(uid, remote.REMOTE)
     can_dl, ai_on = st.db.flag(uid, DL), st.db.flag(uid, AI_FLAG)
     B = InlineKeyboardButton
     text = f"👤 <b>{esc(u['name'] or str(uid))}</b> · <code>{uid}</code>\n" + user_stats(st, u, sizes)
@@ -427,7 +426,6 @@ async def user_card(st: State, uid: int) -> tuple[str, InlineKeyboardMarkup] | N
                callback_data=f"udw:{uid}:c")],
             [B(text=f"🗑 Удалять: {'можно ✅ (запретить)' if can_del else 'нельзя (разрешить)'}", callback_data=f"udl:{uid}:c")],
             [B(text=f"📺 Пульт ТВ: {'есть ✅ (забрать)' if can_tv else 'нет (дать)'}", callback_data=f"urm:{uid}:c")],
-            [B(text=f"🧸 Детский режим: {'вкл ✅ (выключить)' if kid else 'выкл (включить)'}", callback_data=f"ukd:{uid}:c")],
             [B(text=f"🤖 ИИ: {'отмечен ✅' if ai_on else 'не отмечен'}"
                     + (" (сейчас ИИ доступен всем)" if ai_who == "all" else ""), callback_data=f"uai:{uid}:c")],
             [B(text="🚫 Убрать доступ", callback_data=f"urv:{uid}"), B(text="⛔ Заблокировать", callback_data=f"ubl:{uid}")],
@@ -472,9 +470,9 @@ def build_router(st: State) -> Router:
                     "• /podbor — подобрать по жанру, годам и стране;\n"
                     "• /sovet — что посмотреть: похожее на любимое, вместе с группой, по запросу;\n"
                     "• /random — случайный фильм.\n\n"
-                    "/lists — мои списки и подборки, списки групп\n"
+                    "/lists — мой список «Хочу посмотреть» и семейный\n"
                     "/itogi — итоги года\n"
-                    "/gruppy — группы с семьёй и друзьями (общие списки)\n"
+                    "/gruppy — семейная группа\n"
                     "/ocenki — мои оценки\n"
                     "/id — твой Telegram ID")
         return ("Напиши, что хочешь посмотреть:\n"
@@ -487,9 +485,9 @@ def build_router(st: State) -> Router:
                 "• /voices — любимые озвучки: такие раздачи будут первыми со ⭐;\n"
                 "• magnet-ссылку — поставлю сразу;\n"
                 "• голосовое — скажи название; в любом чате <i>@бот название</i> — отправить фильм другу.\n\n"
-                "/lists — мои списки и подборки, списки групп (/want)\n"
+                "/lists — мой список «Хочу посмотреть» и семейный\n"
                 "/itogi — итоги года\n"
-                "/gruppy — группы с семьёй и друзьями\n"
+                "/gruppy — семейная группа\n"
                 "/status — что сейчас качается (там же можно отменить)\n"
                 + ("/delete — удалить скачанное, освободить место\n" if st.hooks["may_delete"](uid) else "")
                 + "/ocenki — что смотрели и оценки (у каждого своя)\n"
@@ -503,9 +501,6 @@ def build_router(st: State) -> Router:
         arg = (command.args or "").strip()
         if st.is_allowed(u.id):
             st.db.touch(u.id)
-            if arg[:2] in ("g_", "l_"):                # v8: приглашение в группу / открытый список
-                await msg.answer(await lists.accept_invite(bot, st, u.id, arg))
-                return
             if await inline.open_from_start(st, msg, u.id, arg):     # v8.2: «Открыть в боте» из инлайна
                 return
             await msg.answer(help_text(u.id))
@@ -514,9 +509,6 @@ def build_router(st: State) -> Router:
             await msg.answer("Доступ закрыт.")
             return
         name = u.full_name + (f" (@{u.username})" if u.username else "")
-        note = lists.invite_note(st, arg) if arg[:2] in ("g_", "l_") else ""
-        if note:
-            st.db.set_pref(u.id, "v8_invite", arg)    # после одобрения — сразу в группу / список
         if not st.db.add_request(u.id, name):
             await msg.answer("Запрос уже отправлен — жди, администратор ответит.")
             return
@@ -528,8 +520,7 @@ def build_router(st: State) -> Router:
         ]])
         for a in cfg.admin_ids:
             try:
-                await bot.send_message(a, f"Запрос доступа: {esc(name)}, ID <code>{u.id}</code>"
-                                          + (f"\n🔗 {esc(note)}" if note else ""), reply_markup=kb)
+                await bot.send_message(a, f"Запрос доступа: {esc(name)}, ID <code>{u.id}</code>", reply_markup=kb)
             except Exception as e:
                 log.warning("не смог написать админу %s: %s", a, e)
         await msg.answer("Запрос отправлен администратору. Как только он подтвердит — я напишу.")
@@ -547,16 +538,11 @@ def build_router(st: State) -> Router:
             st.db.allow(uid, name)
             if action == "okd":                        # v8: сразу с правом качать
                 st.db.set_flag(uid, DL, True)
-            invite = st.db.pref(uid, "v8_invite")
             try:
                 await bot.send_message(uid, "Доступ открыт 🎬\n\n" + help_text(uid))
-                if invite:
-                    st.db.set_flag(uid, "v8_invite", False)
-                    await bot.send_message(uid, await lists.accept_invite(bot, st, uid, invite))
             except Exception:
                 pass
             return "✅ разрешено" + ("" if may_download(st, uid) else " (без права качать — включить в /users)")
-        st.db.set_flag(uid, "v8_invite", False)
         if action == "no":
             st.db.drop_request(uid)
             try:
@@ -594,7 +580,7 @@ def build_router(st: State) -> Router:
         text, kb = await users_view(st)
         await msg.answer(text, reply_markup=kb)
 
-    @r.callback_query(F.data.regexp(r"^(urv|ubl|uub|uok|uno|udl|udw|uai|urm|ukd|uc):\d+(:c)?$|^uref$"))
+    @r.callback_query(F.data.regexp(r"^(urv|ubl|uub|uok|uno|udl|udw|uai|urm|uc):\d+(:c)?$|^uref$"))
     async def users_action(cb: CallbackQuery, bot: Bot):
         if not is_admin(cb.from_user.id):
             await cb.answer("Только для администратора", show_alert=True)
@@ -646,10 +632,6 @@ def build_router(st: State) -> Router:
                         await bot.send_message(uid, "📺 Администратор дал тебе пульт от ТВ: /tv")
                     except Exception:
                         pass
-            elif action == "ukd":
-                on = not st.db.flag(uid, kids.KIDS)
-                st.db.set_flag(uid, kids.KIDS, on)
-                note = "🧸 Детский режим включён" if on else "Детский режим выключен"
             elif action == "uub":
                 st.db.unblock(uid)
                 note = "Разблокирован (может снова попросить доступ)"
@@ -840,10 +822,6 @@ def build_router(st: State) -> Router:
         rel = st.searches[sid][2][int(idx)]
         info = st.searches[sid][3]
         exact = bool(info and tmdb.matches(info, rel.title, rel.is_series))
-        ok, why = await kids.allowed(st, cb.from_user.id, info if exact else None)
-        if not ok:
-            await cb.answer(why, show_alert=True)
-            return
         # своя папка «Название (год)» — если раздача точно про найденный в TMDB фильм
         sub = tmdb.folder_name(info) if exact else None
         if not sub and rel.is_series:
@@ -952,7 +930,7 @@ def build_router(st: State) -> Router:
         найдётся, добавляем сверху кнопку «📋 Magnet» (копирует ссылку для своего торрент-клиента)."""
         lists.remember_info(st, info)
         mtask = (asyncio.create_task(best_magnet(st, info))
-                 if magnet and not may_download(st, uid) and not kids.is_kid(st, uid) else None)
+                 if magnet and not may_download(st, uid) else None)
         kind = "t" if info.is_tv else "m"
         markup = await extras.info_kb(st, info, uid)
         rows = list(markup.inline_keyboard) if markup else []
@@ -1016,10 +994,6 @@ def build_router(st: State) -> Router:
 
     async def raw_search(msg: Message, query: str, uid: int | None = None) -> None:
         """Старый режим: текст как есть уходит на трекеры, обложка — догадка."""
-        if kids.is_kid(st, uid if uid is not None else msg.chat.id):
-            await msg.answer("В детском режиме ищу только по каталогу фильмов — такого там не нашёл. "
-                             "Попробуй написать название иначе.")
-            return
         if not may_download(st, uid if uid is not None else msg.chat.id):
             await msg.answer(f"В каталоге фильмов не нашёл «{esc(query)}». Попробуй написать название иначе "
                              f"или добавь год.")
@@ -1059,7 +1033,7 @@ def build_router(st: State) -> Router:
         if isinstance(details, BaseException):          # без фото и дат — не беда
             log.info("tmdb person details: %r", details)
             details = {}
-        infos = kids.only_kids(st, msg.chat.id, tmdb.filmography(credits, person.department, 40))[:12]
+        infos = tmdb.filmography(credits, person.department, 40)[:12]
         if not infos:
             await wait.edit_text(f"У {esc(person.name)} не нашёл фильмов.")
             return
@@ -1098,7 +1072,7 @@ def build_router(st: State) -> Router:
             who = ""
             try:
                 found, who = await aictl.plot(st, msg.bot, uid, text)
-                infos = kids.only_kids(st, uid, found)
+                infos = found
             except aictl.AiLimit as e:
                 note = f"🤖 {esc(e.reason)} — ищу по Википедии.\n\n"
                 infos = []
@@ -1137,7 +1111,6 @@ def build_router(st: State) -> Router:
             log.warning("wiki: %r", e)
             await wait.edit_text(f"{note}Википедия сейчас не отвечает, попробуй позже.")
             return
-        infos = kids.only_kids(st, uid, infos)
         cid = st.put_choice(text[:100], infos, [])
         if not infos:
             t, kb = render_choice(f"{note}📖 По описанию ничего не нашёл. Добавь конкретики — имена, предметы, "
@@ -1199,7 +1172,6 @@ def build_router(st: State) -> Router:
             await cb.message.edit_text("TMDB сейчас не отвечает, попробуй позже.")
             return
         label = podbor_label(parts)
-        infos = kids.only_kids(st, cb.from_user.id, infos)
         await add_cast(st, infos[:10])
         cid = st.put_choice(label, infos[:10], [])
         base = "pb:" + ":".join(parts[:5])
@@ -1280,9 +1252,6 @@ def build_router(st: State) -> Router:
     async def magnet(msg: Message):
         if not await guard(msg):
             return
-        if kids.is_kid(st, msg.from_user.id):
-            await msg.answer("В детском режиме magnet-ссылки не принимаю — найди мультфильм по названию.")
-            return
         if not may_download(st, msg.from_user.id):
             await msg.answer(NO_DL)
             return
@@ -1312,7 +1281,7 @@ def build_router(st: State) -> Router:
             await show_person(msg, tmdb.people(cands, 1)[0])
             return
         _, year = tmdb.split_query(query)
-        infos = kids.only_kids(st, uid, tmdb.choices(cands, year, 20))[:6]
+        infos = tmdb.choices(cands, year, 20)[:6]
         persons = tmdb.people(cands)
         # длинный запрос может быть описанием сюжета, а не названием
         maybe_plot = len(wiki.keywords(query)) >= 3
@@ -1332,8 +1301,8 @@ def build_router(st: State) -> Router:
         st.remember(cid, text, kb)
         await msg.answer(text, reply_markup=kb)
 
-    # v8: ждали название подборки/группы, а человек занялся другим — больше не ждём
-    KEEP_INPUT = ("Ln:", "Le:", "Gn", "Ge:", "Ra", "Lk")
+    # ждали запрос к ИИ-подбору, а человек занялся другим — больше не ждём
+    KEEP_INPUT = ("Ra", "Lk")
 
     @r.message.outer_middleware()
     async def reset_input_msg(handler, event, data):
@@ -1359,6 +1328,7 @@ def build_router(st: State) -> Router:
     r.include_router(aictl.build_router(st))
     r.include_router(inline.build_router(st))
     r.include_router(itogi.build_router(st))
+    r.include_router(stats.build_router(st))
     r.include_router(voice.build_router(st))
     r.include_router(updater.build_router(st))
     st.hooks.update(find_info=lambda q: find_info(st, q), text_query=text_query,
@@ -1627,10 +1597,6 @@ async def run() -> None:
     st.ai = ai.Chain(cfg, ai_sessions)
     st.stt_http = ai_sessions.get("yandex")                         # v8.2: голосовые — тоже Яндекс, напрямую
     aictl.apply(st)                                # выключенные в /ai сервисы
-    try:
-        lists.setup(st)                            # v8: «Хотим посмотреть» → группа «Семья» (один раз)
-    except Exception as e:
-        log.warning("v8: перенос «Хотим посмотреть» не получился: %r", e)
     log.info("ИИ для поиска по описанию: %s", st.ai.status() if st.ai else "нет ключей — только Википедия")
     kodi_http = None
     if cfg.kodi_url:
@@ -1645,14 +1611,15 @@ async def run() -> None:
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     picks.install(bot)                             # v8.1: выбор номером вместо длинных клавиатур
     dp = Dispatcher()
+    stats.install(dp, st)                          # v8.4: счётчик использования
     dp.include_router(extras.build_router(st))
     dp.include_router(build_router(st))
     await bot.set_my_commands([
         BotCommand(command="status", description="Что сейчас качается (и отмена)"),
         BotCommand(command="podbor", description="Подобрать по жанру, годам, стране"),
-        BotCommand(command="lists", description="Мои списки и подборки, списки групп"),
+        BotCommand(command="lists", description="Мой список и семейный"),
         BotCommand(command="sovet", description="Что посмотреть: похожее, вместе, по запросу"),
-        BotCommand(command="gruppy", description="Группы: семья, друзья"),
+        BotCommand(command="gruppy", description="Семейная группа"),
         BotCommand(command="random", description="Что посмотреть сегодня"),
         BotCommand(command="itogi", description="Итоги года: что посмотрели, лучшее"),
         BotCommand(command="voices", description="Любимые озвучки"),
@@ -1676,7 +1643,6 @@ async def run() -> None:
         log.warning("не удалось настроить очередь Transmission: %r", e)
     tasks.append(asyncio.create_task(subs.loop(bot, st)))
     tasks.append(asyncio.create_task(itogi.loop(bot, st)))
-    tasks.append(asyncio.create_task(listwatch.loop(bot, st)))
     tasks.append(asyncio.create_task(loadguard.guard_loop(bot, st)))
     if st.kodi:
         tasks.append(asyncio.create_task(remote.kodi_sync_loop(st)))

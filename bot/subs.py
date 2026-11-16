@@ -36,7 +36,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup, Message
 
-from . import jacred, kids, tmdb
+from . import jacred, tmdb
 from .access import NO_DL, may_download
 
 log = logging.getLogger("torrbot")
@@ -150,9 +150,6 @@ async def subscribe(st, uid: int, chat_id: int, info: tmdb.Info, row=None) -> tu
     """Подписать uid на сериал. row — закачка, из которой подписались (тема, хеш)."""
     if not info.is_tv:
         return None, "Подписка бывает только на сериалы."
-    ok, why = await kids.allowed(st, uid, info)
-    if not ok:
-        return None, why
     folder = (row["label"] if row is not None and row["label"] else None) or tmdb.folder_name(info)
     existing = st.db.sub_by_tmdb(info.tmdb_id)
     if row is None and existing is None:                 # закачки нет — может, сериал уже качали
@@ -627,10 +624,6 @@ def build_router(st) -> Router:
         info = await info_of(int(tid), kind)
         if not info:
             await cb.answer("TMDB не ответил, попробуй позже", show_alert=True)
-            return
-        ok, why = await kids.allowed(st, uid, info)
-        if not ok:
-            await cb.answer(why, show_alert=True)
             return
         new = st.db.wait_add(kind, info.tmdb_id, info.title, info.year, info.poster, uid, cb.message.chat.id)
         await cb.answer((f"⏳ Жду раздачу от {st.cfg.wait_min_height}p. Проверяю раз в {st.cfg.wait_check_hours:g} ч — "
