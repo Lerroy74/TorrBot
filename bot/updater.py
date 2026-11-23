@@ -35,6 +35,39 @@ class BadZip(Exception):
     pass
 
 
+# S1: после распаковки архива deploy.sh делает git add/commit/push, а docker compose читает
+# docker-compose.yml. Файлы вне белого списка могли бы попасть в репозиторий или исполниться
+# (git hooks, подменённый compose, .ssh) — поэтому разрешаем только известные компоненты.
+ALLOW_EXACT = {"torrbot/VERSION", "torrbot/deploy.sh", "torrbot/rollback.sh", "torrbot/docker-compose.yml",
+               "torrbot/README.md", "torrbot/requirements.txt", "torrbot/Dockerfile", "torrbot/.dockerignore"}
+ALLOW_DIRS = ("torrbot/bot/", "torrbot/host/", "torrbot/pi/", "torrbot/tests/")
+DENY_PARTS = {"hooks", ".git", ".github", ".ssh", "__pycache__"}
+DENY_NAMES = {".env", "secrets.env"}
+
+
+def _bad_path(n: str) -> str | None:
+    """Причина, почему путь в архиве недопустим; None — допустим."""
+    parts = n.split("/")
+    if any(p in DENY_PARTS for p in parts):
+        return "служебная папка (.git/hooks и т.п.)"
+    base = parts[-1]
+    if base in DENY_NAMES or base.endswith((".pem", ".key", ".bak", ".swp")) or base.startswith(".env"):
+        return "секреты/резервные файлы"
+    if n in ALLOW_EXACT:
+        return None
+    if n.startswith(ALLOW_DIRS):
+        if base.endswith(".py") or base == "__init__.py":
+            return None
+        if n.startswith("torrbot/host/") and (base.endswith(".sh") or base.endswith(".py") or "." not in base):
+            return None  # скрипты сервера и файлы без расширения (systemd-units и т.п.)
+        if n.startswith("torrbot/pi/") and base.endswith((".sh", ".py", ".md", ".example")):
+            return None
+        if n.startswith("torrbot/tests/") and not base.endswith((".pyc", ".so")):
+            return None
+        return "не python-файл в bot/tests"
+    return "вне разрешённых папок (bot/, host/, pi/, tests/)"
+
+
 def inspect(data: bytes) -> str:
     """Проверить архив torrbot и вернуть его версию; что не так — BadZip с объяснением."""
     try:
@@ -44,9 +77,18 @@ def inspect(data: bytes) -> str:
     names = z.namelist()
     if not names:
         raise BadZip("архив пустой")
-    for n in names:
+    for i, info in enumerate(z.infolist()):
+        n = info.filename
         if not n.startswith("torrbot/") or ".." in n.split("/") or n.startswith("/") or "\\" in n:
             raise BadZip(f"в архиве лишнее: {n[:60]} (всё должно лежать в папке torrbot/)")
+        if (info.external_attr >> 16) & 0o120000 == 0o120000:
+            raise BadZip(f"в архиве симлинк: {n[:60]} — так нельзя")
+        why = _bad_path(n)
+        if why:
+            raise BadZip(f"в архиве лишнее: {n[:60]} — {why}")
+    total = sum(i.file_size for i in z.infolist())
+    if total > 60 * 1024 * 1024:
+        raise BadZip(f"распакованный архив больше 60 МБ ({total // 1024 // 1024} МБ) — похоже на бомбу")
     for need in ("torrbot/bot/main.py", "torrbot/VERSION", "torrbot/deploy.sh", "torrbot/docker-compose.yml"):
         if need not in names:
             raise BadZip(f"в архиве нет {need}")
